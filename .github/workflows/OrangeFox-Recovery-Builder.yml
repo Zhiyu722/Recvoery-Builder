@@ -1,0 +1,379 @@
+name: OrangeFox - Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_BRANCH:
+        description: 'OrangeFox 分支'
+        required: true
+        default: '14.1'
+        type: choice
+        options:
+          - 14.1
+          - 12.1
+          - 11.0
+
+      DEVICE_TREE:
+        description: '设备树仓库地址'
+        required: true
+        default: 'https://gitee.com/zhiyu722/eebbk-s6-device-tree.git'
+      DEVICE_TREE_BRANCH:
+        description: '设备树分支'
+        required: true
+        default: 'master'
+      DEVICE_PATH:
+        description: '设备树存放路径'
+        required: true
+        default: 'device/EEBBK/P20NH130'
+
+      BUILD_TARGET:
+        description: '构建目标镜像'
+        required: true
+        default: 'recovery'
+        type: choice
+        options:
+          - recovery
+          - boot
+          - vendorboot
+
+      RECOVERY_INSTALLER:
+        description: '是否生成刷机包 ZIP（含 recovery-installer）'
+        required: true
+        default: false
+        type: boolean
+      RECOVERY_TAR:
+        description: '是否生成 .tar 文件（三星设备使用）'
+        required: false
+        default: false
+        type: boolean
+
+      apply_sprd_drm_patch:
+        description: '应用展讯 DRM 显示修复补丁'
+        required: true
+        default: false
+        type: boolean
+      apply_himax_touch_patch:
+        description: '应用 Himax 触摸修复补丁'
+        required: true
+        default: false
+        type: boolean
+
+      upload_release:
+        description: '上传到 GitHub Release'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    name: Build OrangeFox for ${{ github.event.inputs.DEVICE_PATH }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备编译环境
+        run: |
+          sudo apt update
+          sudo apt install -y git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 libncurses5 \
+            lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z1-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig python3-pip \
+            ccache
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > /tmp/repo
+          sudo install -m 0755 /tmp/repo /usr/local/bin/repo
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: 清理磁盘空间
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: 设置交换空间
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      # ====== ccache 缓存：使用 /tmp 且缓存键不含 sha（可复用） ======
+      - name: 设置 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ccache
+          key: ${{ runner.os }}-ccache-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_PATH }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ github.event.inputs.MANIFEST_BRANCH }}-
+            ${{ runner.os }}-ccache-
+
+      - name: 配置 ccache
+        run: |
+          CCACHE_DIR="/tmp/ccache"
+          CCACHE_TEMP="/tmp/ccache-tmp"
+          mkdir -p "$CCACHE_DIR" "$CCACHE_TEMP"
+          chmod 777 "$CCACHE_DIR" "$CCACHE_TEMP"
+          ccache -M 20G
+          echo "CCACHE_DIR=$CCACHE_DIR" >> $GITHUB_ENV
+          echo "CCACHE_EXEC=/usr/bin/ccache" >> $GITHUB_ENV
+          echo "USE_CCACHE=1" >> $GITHUB_ENV
+          echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+          echo "CCACHE_TEMPDIR=$CCACHE_TEMP" >> $GITHUB_ENV
+          echo "CCACHE_SLOPPINESS=time_macros,include_file_mtime,file_macro" >> $GITHUB_ENV
+          echo "✅ ccache 已配置，缓存目录: $CCACHE_DIR，临时目录: $CCACHE_TEMP"
+
+      - name: 同步 OrangeFox 源码
+        run: |
+          mkdir -p ${GITHUB_WORKSPACE}/OrangeFox
+          cd ${GITHUB_WORKSPACE}/OrangeFox
+          git clone https://gitlab.com/OrangeFox/sync.git
+          cd sync
+          ./orangefox_sync.sh --branch ${{ github.event.inputs.MANIFEST_BRANCH }} \
+            --path ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+
+      - name: 克隆设备树（含自动重试）
+        run: |
+          cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+          MAX_RETRIES=3
+          RETRY_DELAY=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "尝试克隆设备树 (尝试 $i/$MAX_RETRIES)..."
+            if git clone --depth=1 ${{ github.event.inputs.DEVICE_TREE }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}; then
+              echo "✅ 克隆成功"
+              break
+            else
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "⚠️ 克隆失败，等待 ${RETRY_DELAY} 秒后重试..."
+                sleep $RETRY_DELAY
+              else
+                echo "❌ 克隆失败，已重试 $MAX_RETRIES 次，退出"
+                exit 1
+              fi
+            fi
+          done
+          cd ${{ github.event.inputs.DEVICE_PATH }}
+          echo "COMMIT_ID=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: 提取设备型号
+        id: device_name
+        run: |
+          DEVICE_PATH="${{ github.event.inputs.DEVICE_PATH }}"
+          DEVICE_NAME=$(basename "$DEVICE_PATH")
+          echo "DEVICE_NAME=${DEVICE_NAME}" >> $GITHUB_ENV
+          echo "提取的设备型号: ${DEVICE_NAME}"
+
+      - name: 应用展讯 DRM 补丁
+        if: github.event.inputs.apply_sprd_drm_patch == 'true'
+        run: |
+          echo "📦 应用展讯 DRM 补丁..."
+          git clone https://github.com/rtyutechstudio/unisoc-twrp-sourcecode_patch.git /tmp/sprd_patch
+          TARGET="OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/bootable/recovery/minuitwrp/graphics_drm.cpp"
+          if [ -f "$TARGET" ]; then
+            rm -f "$TARGET"
+            cp /tmp/sprd_patch/graphics_drm.cpp.sprd_legacy_kms_fixed "$TARGET"
+            echo "✅ 展讯 DRM 补丁已应用"
+          else
+            echo "⚠️ 目标文件不存在，跳过"
+          fi
+
+      - name: 应用 Himax 触摸补丁
+        if: github.event.inputs.apply_himax_touch_patch == 'true'
+        run: |
+          echo "📦 应用 Himax 触摸补丁..."
+          git clone https://github.com/rtyutechstudio/himax_twrp_sourcecode-patch.git /tmp/himax_patch
+          TARGET="OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/bootable/recovery/minuitwrp/events.cpp"
+          if [ -f "$TARGET" ]; then
+            cp "$TARGET" "$TARGET.bak"
+            cp /tmp/himax_patch/events.cpp "$TARGET"
+            echo "✅ Himax 触摸补丁已应用"
+          else
+            echo "⚠️ 目标文件不存在，跳过"
+          fi
+
+      - name: 设置构建命令
+        id: build_cmd
+        run: |
+          BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
+          DEVICE="${{ env.DEVICE_NAME }}"
+          TARGET="${{ github.event.inputs.BUILD_TARGET }}"
+
+          if [[ "$BRANCH" == "14.1" ]]; then
+            CMD="lunch twrp_${DEVICE}-ap2a-eng && make clean && mka ${TARGET}image"
+          elif [[ "$BRANCH" == "12.1" || "$BRANCH" == "11.0" ]]; then
+            CMD="lunch twrp_${DEVICE}-eng && make clean && mka adbd ${TARGET}image"
+          else
+            CMD="lunch omni_${DEVICE}-eng && make clean && mka ${TARGET}image"
+          fi
+          echo "BUILD_CMD=$CMD" >> $GITHUB_ENV
+          echo "使用的构建命令: $CMD"
+
+      - name: 编译 OrangeFox
+        run: |
+          cd ${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+          source build/envsetup.sh
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export CCACHE_DIR="/tmp/ccache"
+          export CCACHE_TEMPDIR="/tmp/ccache-tmp"
+          export USE_CCACHE=1
+          export CCACHE_COMPRESS=1
+          eval ${{ env.BUILD_CMD }}
+
+      - name: 输出 ccache 统计信息
+        run: |
+          ccache -s
+          echo "📊 ccache 缓存使用情况如下："
+          ccache -s | tee ccache_stats.txt
+
+      # ====== 定位产物目录（使用 ls） ======
+      - name: 定位产物目录
+        id: locate
+        run: |
+          BASE="${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
+          DEVICE="${{ env.DEVICE_NAME }}"
+          TARGET="${{ github.event.inputs.BUILD_TARGET }}"
+
+          DIRS=(
+            "$BASE/out/target/product/$DEVICE"
+            "$BASE/out/target/product/$DEVICE/target/product/$DEVICE"
+          )
+
+          FOUND=""
+          for d in "${DIRS[@]}"; do
+            if [ -d "$d" ]; then
+              echo "📁 检查目录: $d"
+              cd "$d"
+              IMG=$(ls OrangeFox*.img 2>/dev/null | head -n1)
+              if [ -z "$IMG" ]; then
+                case "$TARGET" in
+                  recovery)   IMG=$(ls recovery.img 2>/dev/null | head -n1) ;;
+                  boot)       IMG=$(ls boot.img 2>/dev/null | head -n1) ;;
+                  vendorboot) IMG=$(ls vendor_boot.img 2>/dev/null | head -n1) ;;
+                esac
+              fi
+              if [ -n "$IMG" ]; then
+                echo "✅ 找到镜像: $IMG"
+                echo "FILE_PATH=$d" >> $GITHUB_ENV
+                FOUND=1
+                break
+              else
+                echo "⚠️ 该目录下没有匹配的 .img 文件，内容如下："
+                ls -la *.img 2>/dev/null || echo "（无 .img 文件）"
+              fi
+            fi
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "❌ 未找到任何镜像文件，请检查构建日志"
+            exit 1
+          fi
+
+      - name: 生成 MD5
+        run: |
+          cd ${{ env.FILE_PATH }}
+          IMG=$(ls OrangeFox*.img 2>/dev/null | head -n1)
+          if [ -z "$IMG" ]; then
+            case "${{ github.event.inputs.BUILD_TARGET }}" in
+              recovery)   IMG=$(ls recovery.img 2>/dev/null | head -n1) ;;
+              boot)       IMG=$(ls boot.img 2>/dev/null | head -n1) ;;
+              vendorboot) IMG=$(ls vendor_boot.img 2>/dev/null | head -n1) ;;
+            esac
+          fi
+          if [ -n "$IMG" ]; then
+            MD5=$(md5sum "$IMG" | cut -d' ' -f1)
+            echo "MD5_IMG=$MD5" >> $GITHUB_ENV
+            echo "📦 镜像 MD5: $MD5"
+          else
+            echo "⚠️ 未找到镜像文件，跳过 MD5"
+          fi
+
+      - name: 重命名镜像
+        run: |
+          cd ${{ env.FILE_PATH }}
+          TARGET="${{ github.event.inputs.BUILD_TARGET }}"
+          IMG=$(ls OrangeFox*.img 2>/dev/null | head -n1)
+          if [ -z "$IMG" ]; then
+            case "$TARGET" in
+              recovery)   IMG=$(ls recovery.img 2>/dev/null | head -n1) ;;
+              boot)       IMG=$(ls boot.img 2>/dev/null | head -n1) ;;
+              vendorboot) IMG=$(ls vendor_boot.img 2>/dev/null | head -n1) ;;
+            esac
+          fi
+          if [ -z "$IMG" ]; then
+            echo "❌ 没有找到任何镜像文件"
+            exit 1
+          fi
+          TARGET_IMG="${TARGET}.img"
+          if [ "$IMG" != "$TARGET_IMG" ]; then
+            mv "$IMG" "$TARGET_IMG"
+          fi
+          echo "RECOVERY_TYPE=$TARGET" >> $GITHUB_ENV
+          echo "✅ 镜像已就绪: $TARGET_IMG"
+
+      - name: 生成刷机包 ZIP
+        if: github.event.inputs.RECOVERY_INSTALLER == 'true'
+        run: |
+          cd ${{ env.FILE_PATH }}
+          wget -q https://github.com/kinguser981/recovery-installer/releases/download/11256427880/recovery-installer.zip
+          zip -ur recovery-installer.zip ${{ env.RECOVERY_TYPE }}.img
+          echo "✅ 刷机包已更新"
+
+      - name: 生成 .tar 文件
+        if: github.event.inputs.RECOVERY_TAR == 'true'
+        run: |
+          cd ${{ env.FILE_PATH }}
+          tar -cvf ${{ env.RECOVERY_TYPE }}.tar ${{ env.RECOVERY_TYPE }}.img
+
+      - name: 上传镜像 (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-${{ env.DEVICE_NAME }}-${{ github.event.inputs.MANIFEST_BRANCH }}
+          path: |
+            ${{ env.FILE_PATH }}/${{ env.RECOVERY_TYPE }}.img
+            ${{ env.FILE_PATH }}/${{ env.RECOVERY_TYPE }}.tar
+            ${{ env.FILE_PATH }}/recovery-installer.zip
+          if-no-files-found: error
+
+      # ====== 修复 Release 资产路径 ======
+      - name: 准备 Release 资产
+        if: github.event.inputs.upload_release == 'true'
+        run: |
+          mkdir -p ${GITHUB_WORKSPACE}/release_assets
+          cd ${{ env.FILE_PATH }}
+          cp ${{ env.RECOVERY_TYPE }}.img ${GITHUB_WORKSPACE}/release_assets/ 2>/dev/null || true
+          [ -f ${{ env.RECOVERY_TYPE }}.tar ] && cp ${{ env.RECOVERY_TYPE }}.tar ${GITHUB_WORKSPACE}/release_assets/
+          [ -f recovery-installer.zip ] && cp recovery-installer.zip ${GITHUB_WORKSPACE}/release_assets/
+          ls -la ${GITHUB_WORKSPACE}/release_assets/
+
+      - name: 生成 Release 说明
+        if: github.event.inputs.upload_release == 'true'
+        id: release_body
+        run: |
+          BUILD_DATE=$(date +%Y%m%d)
+          DEVICE="${{ env.DEVICE_NAME }}"
+          BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
+          TREE_URL="${{ github.event.inputs.DEVICE_TREE }}"
+          TREE_BRANCH="${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
+          COMMIT="${{ env.COMMIT_ID }}"
+          MD5="${{ env.MD5_IMG }}"
+
+          cat <<EOF > ${GITHUB_WORKSPACE}/release_body.txt
+          Unofficial OrangeFox for ${DEVICE} // ${BUILD_DATE}
+          Target: ${{ env.RECOVERY_TYPE }}.img
+          Build Branch: ${BRANCH}
+          Device Tree: ${TREE_URL} (${TREE_BRANCH})
+          Commit: ${COMMIT}
+          MD5: ${MD5}
+          EOF
+          echo "✅ Release 说明已生成"
+
+      - name: 创建 GitHub Release
+        if: github.event.inputs.upload_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ofox-${{ github.run_id }}
+          name: "OrangeFox Build ${{ github.run_id }}"
+          body_path: ${{ github.workspace }}/release_body.txt
+          draft: false
+          prerelease: true
+          files: ${{ github.workspace }}/release_assets/*
+          fail_on_unmatched_files: false

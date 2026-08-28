@@ -1,0 +1,401 @@
+name: TWRP - Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_repo_url:
+        description: 'TWRP manifest 仓库地址'
+        required: true
+        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git'
+        type: choice
+        options:
+          - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+          - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git
+
+      manifest_branch_preset:
+        description: '选择常用的 manifest 分支（若选“自定义”，请在下方输入）'
+        required: true
+        default: 'twrp-12.1'
+        type: choice
+        options:
+          - twrp-14.1
+          - twrp-14
+          - twrp-12.1
+          - twrp-11
+          - twrp-10.0-deprecated
+          - twrp-9.0
+          - twrp-8.1
+          - twrp-7.1
+          - twrp-6.0
+          - twrp-5.1
+          - twrp-4.4-deprecated
+          - 自定义
+
+      manifest_branch_custom:
+        description: '如果上面选择了“自定义”，请在此输入自定义分支名'
+        required: false
+        default: ''
+
+      device_tree_repo_url:
+        description: '设备树 GitHub 仓库地址'
+        required: true
+        default: 'https://github.com/rtyutechstudio/android_device_oppo_a32-twrp'
+        type: string
+      device_tree_branch:
+        description: '设备树分支'
+        required: true
+        default: 'main'
+        type: string
+      device_tree_path:
+        description: '设备树在源码中的存放路径'
+        required: true
+        default: 'device/oppo/PDVM00'
+        type: string
+
+      lunch_target:
+        description: 'lunch 目标'
+        required: true
+        default: 'twrp_PDVM00-eng'
+        type: string
+
+      build_target:
+        description: '请选择要编译的镜像（三个只能选一个）'
+        required: true
+        default: 'recovery'
+        type: choice
+        options:
+          - recovery
+          - vendor_boot
+          - boot
+
+      upload_zip:
+        description: '是否上传 ZIP 刷机包（作为 Artifact）'
+        required: true
+        default: false
+        type: boolean
+
+      upload_release:
+        description: '是否将产物同时上传到 GitHub Release（默认开启）'
+        required: true
+        default: true
+        type: boolean
+
+      apply_sprd_drm_patch:
+        description: '是否应用展讯DRM显示修复补丁（解决展讯平台TWRP卡Logo无法显示UI的问题）'
+        required: true
+        default: true
+        type: boolean
+
+      apply_himax_touch_patch:
+        description: '是否应用 Himax 触摸屏修复补丁（解决 Himax 触控不释放的问题）'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备编译环境
+        run: |
+          sudo apt update
+          sudo apt install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
+            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            python3 python3-pip repo ccache
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      # ====== 修复 ccache 只读问题：使用 /tmp 目录 ======
+      - name: 设置 ccache 缓存（/tmp 可写）
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ccache
+          key: ${{ runner.os }}-ccache-${{ github.event.inputs.manifest_branch_preset }}-${{ github.event.inputs.device_tree_path }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ github.event.inputs.manifest_branch_preset }}-
+            ${{ runner.os }}-ccache-
+
+      - name: 配置 ccache
+        run: |
+          CCACHE_DIR="/tmp/ccache"
+          CCACHE_TEMP="/tmp/ccache-tmp"
+          mkdir -p "$CCACHE_DIR" "$CCACHE_TEMP"
+          chmod 777 "$CCACHE_DIR" "$CCACHE_TEMP"
+          ccache -M 20G
+          echo "CCACHE_DIR=$CCACHE_DIR" >> $GITHUB_ENV
+          echo "CCACHE_EXEC=/usr/bin/ccache" >> $GITHUB_ENV
+          echo "USE_CCACHE=1" >> $GITHUB_ENV
+          echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
+          echo "CCACHE_TEMPDIR=$CCACHE_TEMP" >> $GITHUB_ENV
+          echo "CCACHE_SLOPPINESS=time_macros,include_file_mtime,file_macro" >> $GITHUB_ENV
+          echo "✅ ccache 已配置，缓存目录: $CCACHE_DIR，临时目录: $CCACHE_TEMP"
+
+      - name: 清理磁盘空间
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: 确定最终使用的 manifest 分支
+        id: manifest_branch
+        run: |
+          if [[ "${{ github.event.inputs.manifest_branch_preset }}" == "自定义" ]]; then
+            BRANCH="${{ github.event.inputs.manifest_branch_custom }}"
+            if [[ -z "$BRANCH" ]]; then
+              echo "❌ 错误：选择了“自定义”但未填写自定义分支名"
+              exit 1
+            fi
+          else
+            BRANCH="${{ github.event.inputs.manifest_branch_preset }}"
+          fi
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "✅ 使用的 manifest 分支: $BRANCH"
+
+      - name: 初始化 repo
+        run: |
+          mkdir -p twrp
+          cd twrp
+          repo init -u "${{ github.event.inputs.manifest_repo_url }}" \
+            -b "${{ steps.manifest_branch.outputs.branch }}" --depth=1
+
+      - name: 通过 local manifest 添加自定义设备树
+        run: |
+          cd twrp
+          mkdir -p .repo/local_manifests
+          
+          DEVICE_TREE_URL="${{ github.event.inputs.device_tree_repo_url }}"
+          DEVICE_TREE_URL="${DEVICE_TREE_URL%.git}"
+          DEVICE_TREE_PATH="${{ github.event.inputs.device_tree_path }}"
+          DEVICE_TREE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
+          
+          if [[ $DEVICE_TREE_URL =~ ^(https?://[^/]+)/(.*)$ ]]; then
+            FETCH="${BASH_REMATCH[1]}"
+            NAME="${BASH_REMATCH[2]}"
+          elif [[ $DEVICE_TREE_URL =~ ^(git@[^:]+):(.*)$ ]]; then
+            FETCH="${BASH_REMATCH[1]}:"
+            NAME="${BASH_REMATCH[2]}"
+          else
+            echo "❌ 不支持的 URL 格式: $DEVICE_TREE_URL"
+            exit 1
+          fi
+          
+          cat > .repo/local_manifests/custom_device.xml << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="custom" fetch="$FETCH" />
+            <project path="$DEVICE_TREE_PATH" name="$NAME" remote="custom" revision="$DEVICE_TREE_BRANCH" />
+          </manifest>
+          EOF
+          
+          echo "✅ 已生成 local manifest"
+
+      - name: 同步源码
+        run: |
+          cd twrp
+          repo sync --force-sync --no-tags --no-clone-bundle -j$(nproc)
+
+      - name: 应用展讯DRM显示修复补丁
+        if: github.event.inputs.apply_sprd_drm_patch == 'true'
+        run: |
+          echo "📦 正在克隆展讯DRM补丁仓库..."
+          git clone https://github.com/rtyutechstudio/unisoc-twrp-sourcecode_patch.git /tmp/sprd_patch
+          
+          TARGET_FILE="twrp/bootable/recovery/minuitwrp/graphics_drm.cpp"
+          
+          if [ -f "$TARGET_FILE" ]; then
+            echo "🗑️ 删除原 graphics_drm.cpp..."
+            rm -f "$TARGET_FILE"
+          else
+            echo "⚠️ 警告：原文件不存在，可能路径不正确，请检查设备树配置"
+          fi
+          
+          echo "📋 复制修复版 graphics_drm.cpp.sprd_legacy_kms_fixed -> graphics_drm.cpp..."
+          cp /tmp/sprd_patch/graphics_drm.cpp.sprd_legacy_kms_fixed "$TARGET_FILE"
+          
+          echo "✅ 展讯DRM补丁已应用"
+
+      - name: 应用 Himax 触摸屏修复补丁
+        if: github.event.inputs.apply_himax_touch_patch == 'true'
+        run: |
+          echo "📦 正在克隆 Himax 触摸补丁仓库..."
+          git clone https://github.com/rtyutechstudio/himax_twrp_sourcecode-patch.git /tmp/himax_patch
+          
+          TARGET_FILE="twrp/bootable/recovery/minuitwrp/events.cpp"
+          
+          if [ -f "$TARGET_FILE" ]; then
+            echo "🗑️ 备份原 events.cpp 为 events.cpp.bak..."
+            cp "$TARGET_FILE" "$TARGET_FILE.bak"
+          else
+            echo "⚠️ 警告：原 events.cpp 不存在，可能路径不正确，请检查设备树配置"
+          fi
+          
+          echo "📋 复制修复版 events.cpp ..."
+          cp /tmp/himax_patch/events.cpp "$TARGET_FILE"
+          
+          echo "✅ Himax 触摸补丁已应用"
+
+      - name: 编译 recovery 镜像
+        if: github.event.inputs.build_target == 'recovery'
+        run: |
+          cd twrp
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.lunch_target }}
+          make clean
+          # 显式导出 ccache 环境，确保子进程继承
+          export CCACHE_DIR="/tmp/ccache"
+          export CCACHE_TEMPDIR="/tmp/ccache-tmp"
+          export USE_CCACHE=1
+          export CCACHE_COMPRESS=1
+          mka recoveryimage ALLOW_MISSING_DEPENDENCIES=true
+
+      - name: 编译 vendor_boot 镜像
+        if: github.event.inputs.build_target == 'vendor_boot'
+        run: |
+          cd twrp
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.lunch_target }}
+          export CCACHE_DIR="/tmp/ccache"
+          export CCACHE_TEMPDIR="/tmp/ccache-tmp"
+          export USE_CCACHE=1
+          export CCACHE_COMPRESS=1
+          mka vendorbootimage ALLOW_MISSING_DEPENDENCIES=true
+
+      - name: 编译 boot 镜像
+        if: github.event.inputs.build_target == 'boot'
+        run: |
+          cd twrp
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.lunch_target }}
+          export CCACHE_DIR="/tmp/ccache"
+          export CCACHE_TEMPDIR="/tmp/ccache-tmp"
+          export USE_CCACHE=1
+          export CCACHE_COMPRESS=1
+          mka bootimage ALLOW_MISSING_DEPENDENCIES=true
+
+      - name: 输出 ccache 统计信息
+        run: |
+          ccache -s
+          echo "📊 ccache 缓存使用情况如下："
+          ccache -s | tee ccache_stats.txt
+
+      - name: 上传 recovery 镜像 (Artifact)
+        if: github.event.inputs.build_target == 'recovery'
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-recovery-${{ github.event.inputs.device_tree_branch }}-${{ github.sha }}
+          path: twrp/out/target/product/*/recovery.img
+          if-no-files-found: error
+
+      - name: 上传 vendor_boot 镜像 (Artifact)
+        if: github.event.inputs.build_target == 'vendor_boot'
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-vendor_boot-${{ github.event.inputs.device_tree_branch }}-${{ github.sha }}
+          path: twrp/out/target/product/*/vendor_boot.img
+          if-no-files-found: error
+
+      - name: 上传 boot 镜像 (Artifact)
+        if: github.event.inputs.build_target == 'boot'
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-boot-${{ github.event.inputs.device_tree_branch }}-${{ github.sha }}
+          path: twrp/out/target/product/*/boot.img
+          if-no-files-found: error
+
+      - name: 上传刷机包 ZIP (Artifact)
+        if: github.event.inputs.upload_zip == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-flashable-${{ github.event.inputs.device_tree_branch }}-${{ github.sha }}
+          path: twrp/out/target/product/*/*.zip
+          if-no-files-found: warn
+
+      - name: 准备 release 资产
+        if: github.event.inputs.upload_release == 'true'
+        run: |
+          mkdir -p release_assets
+          case "${{ github.event.inputs.build_target }}" in
+            recovery)
+              cp twrp/out/target/product/*/recovery.img release_assets/ 2>/dev/null || true
+              ;;
+            vendor_boot)
+              cp twrp/out/target/product/*/vendor_boot.img release_assets/ 2>/dev/null || true
+              ;;
+            boot)
+              cp twrp/out/target/product/*/boot.img release_assets/ 2>/dev/null || true
+              ;;
+          esac
+          if [ "${{ github.event.inputs.upload_zip }}" == "true" ]; then
+            cp twrp/out/target/product/*/*.zip release_assets/ 2>/dev/null || true
+          fi
+          echo "📦 Release 资产列表："
+          ls -la release_assets/ || echo "没有找到任何文件"
+
+      - name: 生成 Release 说明
+        if: github.event.inputs.upload_release == 'true'
+        id: release_body
+        run: |
+          DEVICE_PATH="${{ github.event.inputs.device_tree_path }}"
+          DEVICE_NAME=$(basename "$DEVICE_PATH")
+          if [ -z "$DEVICE_NAME" ]; then
+            DEVICE_NAME="Unknown"
+          fi
+          
+          BUILD_DATE=$(date +%Y%m%d)
+          
+          case "${{ github.event.inputs.build_target }}" in
+            recovery)
+              TARGET_IMG="recovery.img"
+              ;;
+            vendor_boot)
+              TARGET_IMG="vendor_boot.img"
+              ;;
+            boot)
+              TARGET_IMG="boot.img"
+              ;;
+          esac
+          
+          BUILD_BRANCH="${{ steps.manifest_branch.outputs.branch }}"
+          DEVICE_REPO="${{ github.event.inputs.device_tree_repo_url }}"
+          DEVICE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
+          
+          cd twrp/${{ github.event.inputs.device_tree_path }}
+          COMMIT_HASH=$(git log -1 --format="%h")
+          COMMIT_MSG=$(git log -1 --format="%s")
+          COMMIT_INFO="${COMMIT_HASH} ${COMMIT_MSG}"
+          
+          IMG_FILE="release_assets/${TARGET_IMG}"
+          if [ -f "$IMG_FILE" ]; then
+            MD5_SUM=$(md5sum "$IMG_FILE" | cut -d' ' -f1)
+          else
+            MD5_SUM="未找到文件"
+          fi
+          
+          cat <<EOF > release_body.txt
+          Unofficial TWRP for ${DEVICE_NAME} device // ${BUILD_DATE}
+          Target: ${TARGET_IMG}
+          Build: ${BUILD_BRANCH}
+          Device: ${DEVICE_REPO} (${DEVICE_BRANCH})
+          Commit: ${COMMIT_INFO}
+          MD5 (${TARGET_IMG}): ${MD5_SUM}
+          EOF
+          
+          echo "✅ Release 说明已生成："
+          cat release_body.txt
+
+      - name: 创建 GitHub Release 并上传产物
+        if: github.event.inputs.upload_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: twrp-build-${{ github.run_id }}
+          name: "TWRP Build ${{ github.run_id }}"
+          body_path: release_body.txt
+          draft: false
+          prerelease: true
+          files: release_assets/*
+          fail_on_unmatched_files: false

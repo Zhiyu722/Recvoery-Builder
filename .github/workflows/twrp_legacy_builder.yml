@@ -1,0 +1,156 @@
+name: Legacy TWRP Builder (Android <8)
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_repo_url:
+        description: 'TWRP manifest 仓库地址'
+        required: true
+        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git'
+        type: choice
+        options:
+          - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git
+          - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+
+      manifest_branch_preset:
+        description: '选择常用的 manifest 分支（若选“自定义”，请在下方输入）'
+        required: true
+        default: 'twrp-7.1'
+        type: choice
+        options:
+          - twrp-7.1
+          - twrp-6.0
+          - twrp-5.1
+          - twrp-4.4-deprecated
+          - 自定义
+
+      manifest_branch_custom:
+        description: '如果上面选择了“自定义”，请在此输入自定义分支名'
+        required: false
+        default: ''
+
+      device_tree_repo_url:
+        description: '设备树 GitHub 仓库地址'
+        required: true
+        default: 'https://github.com/rtyutechstudio/android_device_oppo_a32-twrp'
+        type: string
+      device_tree_branch:
+        description: '设备树分支'
+        required: true
+        default: 'main'
+        type: string
+      device_tree_path:
+        description: '设备树在源码中的存放路径'
+        required: true
+        default: 'device/oppo/PDVM00'
+        type: string
+
+      lunch_target:
+        description: 'lunch 目标 (例如 twrp_<codename>-eng)'
+        required: true
+        default: 'twrp_PDVM00-eng'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04   # 旧版 Android 编译推荐 20.04，包含旧版 lib 和工具
+    timeout-minutes: 360
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备编译环境 (Legacy)
+        run: |
+          sudo apt update
+          sudo apt install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
+            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            python2 python2-dev python-is-python2 \
+            openjdk-8-jdk
+          # 设置 Java 8 为默认
+          sudo update-alternatives --set java /usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java
+          sudo update-alternatives --set javac /usr/lib/jvm/java-8-openjdk-amd64/bin/javac
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: 清理磁盘空间
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: 确定最终使用的 manifest 分支
+        id: manifest_branch
+        run: |
+          if [[ "${{ github.event.inputs.manifest_branch_preset }}" == "自定义" ]]; then
+            BRANCH="${{ github.event.inputs.manifest_branch_custom }}"
+            if [[ -z "$BRANCH" ]]; then
+              echo "❌ 错误：选择了“自定义”但未填写自定义分支名"
+              exit 1
+            fi
+          else
+            BRANCH="${{ github.event.inputs.manifest_branch_preset }}"
+          fi
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "✅ 使用的 manifest 分支: $BRANCH"
+
+      - name: 初始化 repo (Legacy 兼容参数)
+        run: |
+          mkdir -p twrp
+          cd twrp
+          # 旧版 repo 不支持 --depth=1 的某些情形，因此去掉深度限制
+          repo init -u "${{ github.event.inputs.manifest_repo_url }}" \
+            -b "${{ steps.manifest_branch.outputs.branch }}"
+
+      - name: 通过 local manifest 添加自定义设备树
+        run: |
+          cd twrp
+          mkdir -p .repo/local_manifests
+          
+          DEVICE_TREE_URL="${{ github.event.inputs.device_tree_repo_url }}"
+          DEVICE_TREE_URL="${DEVICE_TREE_URL%.git}"
+          DEVICE_TREE_PATH="${{ github.event.inputs.device_tree_path }}"
+          DEVICE_TREE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
+          
+          if [[ $DEVICE_TREE_URL =~ ^(https?://[^/]+)/(.*)$ ]]; then
+            FETCH="${BASH_REMATCH[1]}"
+            NAME="${BASH_REMATCH[2]}"
+          elif [[ $DEVICE_TREE_URL =~ ^(git@[^:]+):(.*)$ ]]; then
+            FETCH="${BASH_REMATCH[1]}:"
+            NAME="${BASH_REMATCH[2]}"
+          else
+            echo "❌ 不支持的 URL 格式: $DEVICE_TREE_URL"
+            exit 1
+          fi
+          
+          cat > .repo/local_manifests/custom_device.xml << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="custom" fetch="$FETCH" />
+            <project path="$DEVICE_TREE_PATH" name="$NAME" remote="custom" revision="$DEVICE_TREE_BRANCH" />
+          </manifest>
+          EOF
+          
+          echo "✅ 已生成 local manifest"
+
+      - name: 同步源码 (Legacy 兼容)
+        run: |
+          cd twrp
+          # 去掉 --force-sync 等新选项，部分旧 repo 不支持
+          repo sync --no-tags --no-clone-bundle -j$(nproc)
+
+      - name: 编译 recovery 镜像 (Legacy 方式)
+        run: |
+          cd twrp
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.lunch_target }}
+          # 可选清理（根据需要取消注释）
+          # make clean
+          export USE_CCACHE=0
+          # 旧版本使用 make recoveryimage，而非 mka
+          make -j$(nproc) recoveryimage ALLOW_MISSING_DEPENDENCIES=true
+
+      - name: 上传 recovery 镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-legacy-recovery-${{ github.event.inputs.device_tree_branch }}-${{ github.sha }}
+          path: twrp/out/target/product/*/recovery.img
+          if-no-files-found: error
