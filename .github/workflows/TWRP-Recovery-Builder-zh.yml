@@ -6,29 +6,22 @@ on:
       manifest_repo_url:
         description: 'TWRP manifest 仓库地址'
         required: true
-        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git'
+        default: 'https://github.com/nebrassy/platform_manifest_twrp_aosp.git'
         type: choice
         options:
+          - https://github.com/nebrassy/platform_manifest_twrp_aosp.git
           - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
-          - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git
 
       manifest_branch_preset:
         description: '选择常用的 manifest 分支（若选“自定义”，请在下方输入）'
         required: true
-        default: 'twrp-12.1'
+        default: 'twrp-14'
         type: choice
         options:
-          - twrp-14.1
           - twrp-14
           - twrp-12.1
           - twrp-11
           - twrp-10.0-deprecated
-          - twrp-9.0
-          - twrp-8.1
-          - twrp-7.1
-          - twrp-6.0
-          - twrp-5.1
-          - twrp-4.4-deprecated
           - 自定义
 
       manifest_branch_custom:
@@ -44,18 +37,18 @@ on:
       device_tree_branch:
         description: '设备树分支'
         required: true
-        default: 'master'
+        default: 'main'
         type: string
       device_tree_path:
         description: '设备树在源码中的存放路径'
         required: true
-        default: 'device/EEBBK/P24NH180'
+        default: 'device/oppo/PDVM00'
         type: string
 
       lunch_target:
         description: 'lunch 目标'
         required: true
-        default: 'twrp_P24NH180-eng'
+        default: 'twrp_PDVM00-eng'
         type: string
 
       build_target:
@@ -71,7 +64,7 @@ on:
       upload_zip:
         description: '是否上传 ZIP 刷机包（作为 Artifact）'
         required: true
-        default: false
+        default: true
         type: boolean
 
       upload_release:
@@ -83,13 +76,13 @@ on:
       apply_sprd_drm_patch:
         description: '是否应用展讯DRM显示修复补丁（解决展讯平台TWRP卡Logo无法显示UI的问题）'
         required: true
-        default: true
+        default: false
         type: boolean
 
       apply_himax_touch_patch:
         description: '是否应用 Himax 触摸屏修复补丁（解决 Himax 触控不释放的问题）'
         required: true
-        default: true
+        default: false
         type: boolean
 
 jobs:
@@ -113,7 +106,6 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-      # ====== 修复 ccache 只读问题：使用 /tmp 目录 ======
       - name: 设置 ccache 缓存（/tmp 可写）
         uses: actions/cache@v4
         with:
@@ -245,8 +237,6 @@ jobs:
           cd twrp
           source build/envsetup.sh
           lunch ${{ github.event.inputs.lunch_target }}
-          make clean
-          # 显式导出 ccache 环境，确保子进程继承
           export CCACHE_DIR="/tmp/ccache"
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
@@ -336,6 +326,7 @@ jobs:
           echo "📦 Release 资产列表："
           ls -la release_assets/ || echo "没有找到任何文件"
 
+      # ====== 生成 Release 说明（更丰富的信息） ======
       - name: 生成 Release 说明
         if: github.event.inputs.upload_release == 'true'
         id: release_body
@@ -361,8 +352,10 @@ jobs:
           esac
           
           BUILD_BRANCH="${{ steps.manifest_branch.outputs.branch }}"
+          MANIFEST_REPO="${{ github.event.inputs.manifest_repo_url }}"
           DEVICE_REPO="${{ github.event.inputs.device_tree_repo_url }}"
           DEVICE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
+          LUNCH_TARGET="${{ github.event.inputs.lunch_target }}"
           
           cd twrp/${{ github.event.inputs.device_tree_path }}
           COMMIT_HASH=$(git log -1 --format="%h")
@@ -377,12 +370,16 @@ jobs:
           fi
           
           cat <<EOF > release_body.txt
-          Unofficial TWRP for ${DEVICE_NAME} device // ${BUILD_DATE}
-          Target: ${TARGET_IMG}
-          Build: ${BUILD_BRANCH}
-          Device: ${DEVICE_REPO} (${DEVICE_BRANCH})
-          Commit: ${COMMIT_INFO}
-          MD5 (${TARGET_IMG}): ${MD5_SUM}
+          ## Unofficial TWRP for ${DEVICE_NAME} // ${BUILD_DATE}
+          
+          **Target:** \`${TARGET_IMG}\`
+          **Manifest:** \`${MANIFEST_REPO}\` (\`${BUILD_BRANCH}\`)
+          **Device Tree:** \`${DEVICE_REPO}\` (\`${DEVICE_BRANCH}\`)
+          **Lunch Target:** \`${LUNCH_TARGET}\`
+          **Commit:** \`${COMMIT_INFO}\`
+          **MD5 (${TARGET_IMG}):** \`${MD5_SUM}\`
+          
+          > 此构建由 GitHub Actions 自动生成，仅供测试使用。
           EOF
           
           echo "✅ Release 说明已生成："
