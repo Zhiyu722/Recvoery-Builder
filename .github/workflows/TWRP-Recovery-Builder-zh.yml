@@ -37,18 +37,18 @@ on:
       device_tree_branch:
         description: '设备树分支'
         required: true
-        default: 'main'
+        default: 'master'
         type: string
       device_tree_path:
         description: '设备树在源码中的存放路径'
         required: true
-        default: 'device/oppo/PDVM00'
+        default: 'device/EEBBK/P24NH280'
         type: string
 
       lunch_target:
         description: 'lunch 目标'
         required: true
-        default: 'twrp_PDVM00-eng'
+        default: 'twrp_P24NH280-eng'
         type: string
 
       build_target:
