@@ -1,4 +1,4 @@
-name: TWRP -- Build
+name: TWRP-Recovery-Builder-zh
 
 on:
   workflow_dispatch:
