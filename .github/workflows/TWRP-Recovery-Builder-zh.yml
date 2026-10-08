@@ -90,8 +90,12 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: 准备编译环境
+      # ============================================================
+      # Set up job：安装依赖 + 清理磁盘 + 检查资源
+      # ============================================================
+      - name: Set up job
         run: |
+          echo "===== 安装编译依赖 ====="
           sudo apt update
           sudo apt install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
             gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
@@ -100,13 +104,8 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-      # ====== 激进清理：释放磁盘空间 ======
-      - name: 清理无用文件（释放磁盘空间）
-        run: |
-          echo "===== 清理前磁盘占用 ====="
+          echo "===== 清理无用文件（释放磁盘空间） ====="
           df -h /
-          echo "===== 开始清理 ====="
-
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /opt/ghc || true
@@ -118,15 +117,19 @@ jobs:
           sudo rm -rf /usr/share/sbt || true
           sudo rm -rf /usr/share/miniconda || true
           sudo rm -rf /usr/local/share/powershell || true
-
           sudo apt clean
           sudo apt autoremove -y
-
-          sudo rm -rf /usr/share/dotnet/sdk || true
           sudo rm -rf /var/lib/docker || true
           sudo rm -rf /tmp/* || true
+          echo "清理后："
+          df -h /
 
-          echo "===== 清理后磁盘占用 ====="
+          echo "===== 检查资源情况 ====="
+          echo "--- 内存 ---"
+          free -h
+          echo "--- Swap ---"
+          swapon --show || echo "⚠️ 无 swap"
+          echo "--- 磁盘 ---"
           df -h /
 
       - name: 设置交换空间
@@ -134,16 +137,7 @@ jobs:
         with:
           swap-size-gb: 24
 
-      - name: 检查资源情况
-        run: |
-          echo "===== 内存 ====="
-          free -h
-          echo "===== Swap ====="
-          swapon --show || echo "⚠️ 无 swap"
-          echo "===== 磁盘 ====="
-          df -h /
-
-      - name: 设置 ccache 缓存（/tmp 可写）
+      - name: 设置 ccache 缓存
         uses: actions/cache@v4
         with:
           path: /tmp/ccache
@@ -152,8 +146,13 @@ jobs:
             ${{ runner.os }}-ccache-${{ github.event.inputs.manifest_branch_preset }}-
             ${{ runner.os }}-ccache-
 
-      - name: 配置 ccache
+      # ============================================================
+      # Configure build：配置 ccache + 确定分支 + 设置 lunch
+      # ============================================================
+      - name: Configure build
+        id: config
         run: |
+          # ----- 配置 ccache -----
           CCACHE_DIR="/tmp/ccache"
           CCACHE_TEMP="/tmp/ccache-tmp"
           mkdir -p "$CCACHE_DIR" "$CCACHE_TEMP"
@@ -165,11 +164,9 @@ jobs:
           echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
           echo "CCACHE_TEMPDIR=$CCACHE_TEMP" >> $GITHUB_ENV
           echo "CCACHE_SLOPPINESS=time_macros,include_file_mtime,file_macro" >> $GITHUB_ENV
-          echo "✅ ccache 已配置，缓存目录: $CCACHE_DIR，临时目录: $CCACHE_TEMP"
+          echo "✅ ccache 已配置"
 
-      - name: 确定最终使用的 manifest 分支
-        id: manifest_branch
-        run: |
+          # ----- 确定 manifest 分支 -----
           if [[ "${{ github.event.inputs.manifest_branch_preset }}" == "自定义" ]]; then
             BRANCH="${{ github.event.inputs.manifest_branch_custom }}"
             if [[ -z "$BRANCH" ]]; then
@@ -179,18 +176,14 @@ jobs:
           else
             BRANCH="${{ github.event.inputs.manifest_branch_preset }}"
           fi
-          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "BUILD_BRANCH=$BRANCH" >> $GITHUB_ENV
           echo "✅ 使用的 manifest 分支: $BRANCH"
 
-      # ====== 自动生成 lunch 目标 ======
-      - name: 设置 lunch 目标
-        id: lunch_target
-        run: |
+          # ----- 自动生成 lunch 目标 -----
           DEVICE_PATH="${{ github.event.inputs.device_tree_path }}"
           DEVICE_NAME=$(basename "$DEVICE_PATH")
-          echo "设备名: $DEVICE_NAME"
+          echo "DEVICE_NAME=$DEVICE_NAME" >> $GITHUB_ENV
 
-          BRANCH="${{ steps.manifest_branch.outputs.branch }}"
           if [[ "$BRANCH" == twrp-14* || "$BRANCH" == twrp-14.1* ]]; then
             LUNCH="twrp_${DEVICE_NAME}-ap2a-eng"
           else
@@ -204,7 +197,7 @@ jobs:
           mkdir -p twrp
           cd twrp
           repo init -u "${{ github.event.inputs.manifest_repo_url }}" \
-            -b "${{ steps.manifest_branch.outputs.branch }}" --depth=1
+            -b "${{ env.BUILD_BRANCH }}" --depth=1
 
       - name: 通过 local manifest 添加自定义设备树
         run: |
@@ -423,7 +416,7 @@ jobs:
               ;;
           esac
           
-          BUILD_BRANCH="${{ steps.manifest_branch.outputs.branch }}"
+          BUILD_BRANCH="${{ env.BUILD_BRANCH }}"
           MANIFEST_REPO="${{ github.event.inputs.manifest_repo_url }}"
           DEVICE_REPO="${{ github.event.inputs.device_tree_repo_url }}"
           DEVICE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
