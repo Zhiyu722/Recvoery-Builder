@@ -97,12 +97,8 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
 
-      # ============================================================
-      # Setup Build Environment：安装依赖 + 清理磁盘 + 检查资源
-      # ============================================================
-      - name: Setup Build Environment
+      - name: 准备编译环境
         run: |
-          echo "===== 安装编译依赖 ====="
           sudo apt update
           sudo apt install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
             gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
@@ -111,7 +107,9 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-          echo "===== 清理无用文件（释放磁盘空间） ====="
+      - name: 清理磁盘空间
+        run: |
+          echo "===== 清理前磁盘占用 ====="
           df -h /
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /usr/local/lib/android || true
@@ -128,15 +126,7 @@ jobs:
           sudo apt autoremove -y
           sudo rm -rf /var/lib/docker || true
           sudo rm -rf /tmp/* || true
-          echo "清理后："
-          df -h /
-
-          echo "===== 检查资源情况 ====="
-          echo "--- 内存 ---"
-          free -h
-          echo "--- Swap ---"
-          swapon --show || echo "⚠️ 无 swap"
-          echo "--- 磁盘 ---"
+          echo "===== 清理后磁盘占用 ====="
           df -h /
 
       - name: 设置交换空间
@@ -153,13 +143,8 @@ jobs:
             ${{ runner.os }}-ccache-${{ github.event.inputs.manifest_branch_preset }}-
             ${{ runner.os }}-ccache-
 
-      # ============================================================
-      # Configure Build：配置 ccache + 确定分支 + 设置 lunch
-      # ============================================================
-      - name: Configure Build
-        id: config
+      - name: 配置 ccache
         run: |
-          # ----- 配置 ccache -----
           CCACHE_DIR="/tmp/ccache"
           CCACHE_TEMP="/tmp/ccache-tmp"
           mkdir -p "$CCACHE_DIR" "$CCACHE_TEMP"
@@ -173,7 +158,9 @@ jobs:
           echo "CCACHE_SLOPPINESS=time_macros,include_file_mtime,file_macro" >> $GITHUB_ENV
           echo "✅ ccache 已配置"
 
-          # ----- 确定 manifest 分支 -----
+      - name: 确定最终使用的 manifest 分支
+        id: manifest_branch
+        run: |
           if [[ "${{ github.event.inputs.manifest_branch_preset }}" == "自定义" ]]; then
             BRANCH="${{ github.event.inputs.manifest_branch_custom }}"
             if [[ -z "$BRANCH" ]]; then
@@ -183,14 +170,19 @@ jobs:
           else
             BRANCH="${{ github.event.inputs.manifest_branch_preset }}"
           fi
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "BUILD_BRANCH=$BRANCH" >> $GITHUB_ENV
           echo "✅ 使用的 manifest 分支: $BRANCH"
 
-          # ----- 自动生成 lunch 目标 -----
+      - name: 设置 lunch 目标
+        id: lunch_target
+        run: |
           DEVICE_PATH="${{ github.event.inputs.device_tree_path }}"
           DEVICE_NAME=$(basename "$DEVICE_PATH")
+          echo "设备名: $DEVICE_NAME"
           echo "DEVICE_NAME=$DEVICE_NAME" >> $GITHUB_ENV
 
+          BRANCH="${{ steps.manifest_branch.outputs.branch }}"
           if [[ "$BRANCH" == twrp-14* || "$BRANCH" == twrp-14.1* ]]; then
             LUNCH="twrp_${DEVICE_NAME}-ap2a-eng"
           else
@@ -210,12 +202,12 @@ jobs:
         run: |
           cd twrp
           mkdir -p .repo/local_manifests
-          
+
           DEVICE_TREE_URL="${{ github.event.inputs.device_tree_repo_url }}"
           DEVICE_TREE_URL="${DEVICE_TREE_URL%.git}"
           DEVICE_TREE_PATH="${{ github.event.inputs.device_tree_path }}"
           DEVICE_TREE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
-          
+
           if [[ $DEVICE_TREE_URL =~ ^(https?://[^/]+)/(.*)$ ]]; then
             FETCH="${BASH_REMATCH[1]}"
             NAME="${BASH_REMATCH[2]}"
@@ -226,129 +218,58 @@ jobs:
             echo "❌ 不支持的 URL 格式: $DEVICE_TREE_URL"
             exit 1
           fi
-          
-          cat > .repo/local_manifests/custom_device.xml << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <manifest>
-            <remote name="custom" fetch="$FETCH" />
-            <project path="$DEVICE_TREE_PATH" name="$NAME" remote="custom" revision="$DEVICE_TREE_BRANCH" />
-          </manifest>
-          EOF
-          
-          echo "✅ 已生成 local manifest"
+
+          echo '<?xml version="1.0" encoding="UTF-8"?>' > .repo/local_manifests/custom_device.xml
+          echo '<manifest>' >> .repo/local_manifests/custom_device.xml
+          echo "  <remote name=\"custom\" fetch=\"$FETCH\" />" >> .repo/local_manifests/custom_device.xml
+          echo "  <project path=\"$DEVICE_TREE_PATH\" name=\"$NAME\" remote=\"custom\" revision=\"$DEVICE_TREE_BRANCH\" />" >> .repo/local_manifests/custom_device.xml
+          echo '</manifest>' >> .repo/local_manifests/custom_device.xml
+
+          echo "✅ 已生成 local manifest："
+          cat .repo/local_manifests/custom_device.xml
 
       - name: 同步源码
         run: |
           cd twrp
           repo sync --force-sync --no-tags --no-clone-bundle -j$(nproc)
 
-      # ============================================================
-      # 临时绕过 Soong 插件验证（CI 专用，直接改源码）
-      # ============================================================
       - name: 临时绕过 Soong 插件验证
         run: |
           echo "🔍 搜索相关源文件..."
-
           CONFIG_FILES=$(grep -rln "func.*BuildBrokenPluginValidation" twrp/build/soong/ 2>/dev/null || true)
-          ERR_FILES=$(grep -rln "New plugins are not supported" twrp/build/soong/ 2>/dev/null || true)
-
           echo "定义 BuildBrokenPluginValidation 的文件："
           echo "$CONFIG_FILES"
-          echo ""
-          echo "出现报错信息的文件："
-          echo "$ERR_FILES"
-          echo ""
-
-          SKIP_FALLBACK=""
 
           if [ -n "$CONFIG_FILES" ]; then
             for f in $CONFIG_FILES; do
               echo "🔧 修改: $f"
-              export TARGET_FILE="$f"
-              python3 << 'PYEOF'
-import re, os
-path = os.environ['TARGET_FILE']
-with open(path) as fp:
-    content = fp.read()
-pattern = r'(func\s+\([^)]*\)\s+BuildBrokenPluginValidation\(\)\s+bool\s*\{)[^}]*(\})'
-new_content = re.sub(pattern, r'\1\n\treturn true\n\2', content, count=1)
-if new_content != content:
-    with open(path, 'w') as fp:
-        fp.write(new_content)
-    print("  ✅ 已改为 return true")
-else:
-    print("  ⚠️ 未匹配到函数体，改用方式2")
-PYEOF
+              sed -i '/func.*BuildBrokenPluginValidation/,/^}/ s/return .*/return true/' "$f"
               echo "  修改后："
-              grep -n -A3 "BuildBrokenPluginValidation" "$f" || true
-              echo ""
+              grep -A3 "BuildBrokenPluginValidation" "$f" || true
             done
-            SKIP_FALLBACK="1"
+            echo "✅ 已让 BuildBrokenPluginValidation 始终返回 true"
+          else
+            echo "⚠️ 未找到相关文件，跳过"
           fi
-
-          if [ -z "$SKIP_FALLBACK" ] && [ -n "$ERR_FILES" ]; then
-            for f in $ERR_FILES; do
-              echo "📁 报错文件: $f"
-              export TARGET_FILE="$f"
-              python3 << 'PYEOF'
-import re, os
-path = os.environ['TARGET_FILE']
-with open(path) as fp:
-    lines = fp.read().split('\n')
-
-target_idx = None
-for i, line in enumerate(lines):
-    if 'New plugins are not supported' in line:
-        target_idx = i
-        break
-
-if target_idx is None:
-    print("  未找到报错信息")
-else:
-    modified = False
-    for j in range(target_idx, max(-1, target_idx - 20), -1):
-        line = lines[j]
-        if re.match(r'\s*if\s', line):
-            original = line
-            if '{' in line:
-                lines[j] = re.sub(r'if\s+.+?\{', 'if false {', line)
-            else:
-                lines[j] = re.sub(r'if\s+.+$', 'if false', line)
-            print(f"  原 if: {original.strip()}")
-            print(f"  新 if: {lines[j].strip()}")
-            modified = True
-            break
-    if modified:
-        with open(path, 'w') as fp:
-            fp.write('\n'.join(lines))
-        print("  ✅ 已注释掉报错分支")
-    else:
-        print("  ⚠️ 未找到可修改的 if")
-PYEOF
-              echo ""
-            done
-          fi
-
-          echo "✅ Soong 修改步骤完成"
 
       - name: 应用展讯DRM显示修复补丁
         if: github.event.inputs.apply_sprd_drm_patch == 'true'
         run: |
           echo "📦 正在克隆展讯DRM补丁仓库..."
           git clone https://github.com/rtyutechstudio/unisoc-twrp-sourcecode_patch.git /tmp/sprd_patch
-          
+
           TARGET_FILE="twrp/bootable/recovery/minuitwrp/graphics_drm.cpp"
-          
+
           if [ -f "$TARGET_FILE" ]; then
             echo "🗑️ 删除原 graphics_drm.cpp..."
             rm -f "$TARGET_FILE"
           else
             echo "⚠️ 警告：原文件不存在，可能路径不正确，请检查设备树配置"
           fi
-          
+
           echo "📋 复制修复版 graphics_drm.cpp.sprd_legacy_kms_fixed -> graphics_drm.cpp..."
           cp /tmp/sprd_patch/graphics_drm.cpp.sprd_legacy_kms_fixed "$TARGET_FILE"
-          
+
           echo "✅ 展讯DRM补丁已应用"
 
       - name: 应用 Himax 触摸屏修复补丁
@@ -356,19 +277,19 @@ PYEOF
         run: |
           echo "📦 正在克隆 Himax 触摸补丁仓库..."
           git clone https://github.com/rtyutechstudio/himax_twrp_sourcecode-patch.git /tmp/himax_patch
-          
+
           TARGET_FILE="twrp/bootable/recovery/minuitwrp/events.cpp"
-          
+
           if [ -f "$TARGET_FILE" ]; then
             echo "🗑️ 备份原 events.cpp 为 events.cpp.bak..."
             cp "$TARGET_FILE" "$TARGET_FILE.bak"
           else
             echo "⚠️ 警告：原 events.cpp 不存在，可能路径不正确，请检查设备树配置"
           fi
-          
+
           echo "📋 复制修复版 events.cpp ..."
           cp /tmp/himax_patch/events.cpp "$TARGET_FILE"
-          
+
           echo "✅ Himax 触摸补丁已应用"
 
       - name: 编译 recovery 镜像
@@ -414,7 +335,6 @@ PYEOF
         run: |
           ccache -s
           echo "📊 ccache 缓存使用情况如下："
-          ccache -s | tee ccache_stats.txt
 
       - name: 上传 recovery 镜像 (Artifact)
         if: github.event.inputs.build_target == 'recovery'
@@ -478,9 +398,9 @@ PYEOF
           if [ -z "$DEVICE_NAME" ]; then
             DEVICE_NAME="Unknown"
           fi
-          
+
           BUILD_DATE=$(date +%Y%m%d)
-          
+
           case "${{ github.event.inputs.build_target }}" in
             recovery)
               TARGET_IMG="recovery.img"
@@ -492,38 +412,36 @@ PYEOF
               TARGET_IMG="boot.img"
               ;;
           esac
-          
+
           BUILD_BRANCH="${{ env.BUILD_BRANCH }}"
           MANIFEST_REPO="${{ github.event.inputs.manifest_repo_url }}"
           DEVICE_REPO="${{ github.event.inputs.device_tree_repo_url }}"
           DEVICE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
           LUNCH_TARGET="${{ env.LUNCH_TARGET }}"
-          
+
           cd twrp/${{ github.event.inputs.device_tree_path }}
           COMMIT_HASH=$(git log -1 --format="%h")
           COMMIT_MSG=$(git log -1 --format="%s")
           COMMIT_INFO="${COMMIT_HASH} ${COMMIT_MSG}"
-          
+
           IMG_FILE="release_assets/${TARGET_IMG}"
           if [ -f "$IMG_FILE" ]; then
             MD5_SUM=$(md5sum "$IMG_FILE" | cut -d' ' -f1)
           else
             MD5_SUM="未找到文件"
           fi
-          
-          cat <<EOF > release_body.txt
-          ## Unofficial TWRP for ${DEVICE_NAME} // ${BUILD_DATE}
-          
-          **Target:** \`${TARGET_IMG}\`
-          **Manifest:** \`${MANIFEST_REPO}\` (\`${BUILD_BRANCH}\`)
-          **Device Tree:** \`${DEVICE_REPO}\` (\`${DEVICE_BRANCH}\`)
-          **Lunch Target:** \`${LUNCH_TARGET}\`
-          **Commit:** \`${COMMIT_INFO}\`
-          **MD5 (${TARGET_IMG}):** \`${MD5_SUM}\`
-          
-          > 此构建由 GitHub Actions 自动生成，仅供测试使用。
-          EOF
-          
+
+          echo "## Unofficial TWRP for ${DEVICE_NAME} // ${BUILD_DATE}" > release_body.txt
+          echo "" >> release_body.txt
+          echo "**Target:** \`${TARGET_IMG}\`" >> release_body.txt
+          echo "**Manifest:** \`${MANIFEST_REPO}\` (\`${BUILD_BRANCH}\`)" >> release_body.txt
+          echo "**Device Tree:** \`${DEVICE_REPO}\` (\`${DEVICE_BRANCH}\`)" >> release_body.txt
+          echo "**Lunch Target:** \`${LUNCH_TARGET}\`" >> release_body.txt
+          echo "**Commit:** \`${COMMIT_INFO}\`" >> release_body.txt
+          echo "**MD5 (${TARGET_IMG}):** \`${MD5_SUM}\`" >> release_body.txt
+          echo "" >> release_body.txt
+          echo "> 此构建由 GitHub Actions 自动生成，仅供测试使用。" >> release_body.txt
+
           echo "✅ Release 说明已生成："
           cat release_body.txt
 
