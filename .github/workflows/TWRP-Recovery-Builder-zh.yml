@@ -107,7 +107,6 @@ jobs:
           df -h /
           echo "===== 开始清理 ====="
 
-          # 删除常见大体积预装软件
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /opt/ghc || true
@@ -120,15 +119,11 @@ jobs:
           sudo rm -rf /usr/share/miniconda || true
           sudo rm -rf /usr/local/share/powershell || true
 
-          # 清理 apt 缓存
           sudo apt clean
           sudo apt autoremove -y
 
-          # 清理 Docker 镜像（如果存在）
           sudo rm -rf /usr/share/dotnet/sdk || true
           sudo rm -rf /var/lib/docker || true
-
-          # 清理临时文件
           sudo rm -rf /tmp/* || true
 
           echo "===== 清理后磁盘占用 ====="
@@ -139,7 +134,6 @@ jobs:
         with:
           swap-size-gb: 24
 
-      # ====== 校验资源情况 ======
       - name: 检查资源情况
         run: |
           echo "===== 内存 ====="
@@ -248,6 +242,25 @@ jobs:
           cd twrp
           repo sync --force-sync --no-tags --no-clone-bundle -j$(nproc)
 
+      # ====== 临时允许 Soong 新插件（仅本次构建有效） ======
+      - name: 临时允许 Soong 新插件
+        run: |
+          DEVICE_PATH="${{ github.event.inputs.device_tree_path }}"
+          BOARD_CONFIG="twrp/${DEVICE_PATH}/BoardConfig.mk"
+          if [ ! -f "$BOARD_CONFIG" ]; then
+            echo "❌ 未找到 $BOARD_CONFIG"
+            exit 1
+          fi
+
+          if grep -q "BUILD_BROKEN_PLUGIN_VALIDATION" "$BOARD_CONFIG"; then
+            echo "✅ BoardConfig.mk 已包含 BUILD_BROKEN_PLUGIN_VALIDATION，无需追加"
+          else
+            printf '\nBUILD_BROKEN_PLUGIN_VALIDATION := true\n' >> "$BOARD_CONFIG"
+            echo "✅ 已在 CI 中临时追加 BUILD_BROKEN_PLUGIN_VALIDATION := true"
+          fi
+          echo "当前 BoardConfig.mk 末尾："
+          tail -5 "$BOARD_CONFIG"
+
       - name: 应用展讯DRM显示修复补丁
         if: github.event.inputs.apply_sprd_drm_patch == 'true'
         run: |
@@ -299,7 +312,6 @@ jobs:
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
           export CCACHE_COMPRESS=1
-          # 限制并行度为 2，降低内存峰值
           mka recoveryimage ALLOW_MISSING_DEPENDENCIES=true -j2
 
       - name: 编译 vendor_boot 镜像
@@ -451,7 +463,6 @@ jobs:
         with:
           tag_name: twrp-build-${{ github.run_id }}
           name: "TWRP Build ${{ github.run_id }}"
-          body: release_body.txt
           body_path: release_body.txt
           draft: false
           prerelease: true
