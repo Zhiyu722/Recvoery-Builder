@@ -37,18 +37,12 @@ on:
       device_tree_branch:
         description: '设备树分支'
         required: true
-        default: 'master'
+        default: 'main'
         type: string
       device_tree_path:
-        description: '设备树在源码中的存放路径'
+        description: '设备树在源码中的存放路径（如 device/oppo/P24NH280）'
         required: true
-        default: 'device/EEBBK/P24NH280'
-        type: string
-
-      lunch_target:
-        description: 'lunch 目标'
-        required: true
-        default: 'twrp_P24NH280-eng'
+        default: 'device/oppo/PDVM00'
         type: string
 
       build_target:
@@ -148,6 +142,25 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "✅ 使用的 manifest 分支: $BRANCH"
 
+      # ====== 自动生成 lunch 目标 ======
+      - name: 设置 lunch 目标
+        id: lunch_target
+        run: |
+          # 从设备树路径提取设备名（最后一段）
+          DEVICE_PATH="${{ github.event.inputs.device_tree_path }}"
+          DEVICE_NAME=$(basename "$DEVICE_PATH")
+          echo "设备名: $DEVICE_NAME"
+
+          # 根据 manifest 分支决定后缀
+          BRANCH="${{ steps.manifest_branch.outputs.branch }}"
+          if [[ "$BRANCH" == twrp-14* || "$BRANCH" == twrp-14.1* ]]; then
+            LUNCH="twrp_${DEVICE_NAME}-ap2a-eng"
+          else
+            LUNCH="twrp_${DEVICE_NAME}-eng"
+          fi
+          echo "LUNCH_TARGET=$LUNCH" >> $GITHUB_ENV
+          echo "✅ 自动生成的 lunch 目标: $LUNCH"
+
       - name: 初始化 repo
         run: |
           mkdir -p twrp
@@ -236,7 +249,8 @@ jobs:
         run: |
           cd twrp
           source build/envsetup.sh
-          lunch ${{ github.event.inputs.lunch_target }}
+          echo "使用 lunch 目标: ${{ env.LUNCH_TARGET }}"
+          lunch ${{ env.LUNCH_TARGET }}
           export CCACHE_DIR="/tmp/ccache"
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
@@ -248,7 +262,8 @@ jobs:
         run: |
           cd twrp
           source build/envsetup.sh
-          lunch ${{ github.event.inputs.lunch_target }}
+          echo "使用 lunch 目标: ${{ env.LUNCH_TARGET }}"
+          lunch ${{ env.LUNCH_TARGET }}
           export CCACHE_DIR="/tmp/ccache"
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
@@ -260,7 +275,8 @@ jobs:
         run: |
           cd twrp
           source build/envsetup.sh
-          lunch ${{ github.event.inputs.lunch_target }}
+          echo "使用 lunch 目标: ${{ env.LUNCH_TARGET }}"
+          lunch ${{ env.LUNCH_TARGET }}
           export CCACHE_DIR="/tmp/ccache"
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
@@ -326,7 +342,6 @@ jobs:
           echo "📦 Release 资产列表："
           ls -la release_assets/ || echo "没有找到任何文件"
 
-      # ====== 生成 Release 说明（更丰富的信息） ======
       - name: 生成 Release 说明
         if: github.event.inputs.upload_release == 'true'
         id: release_body
@@ -355,7 +370,7 @@ jobs:
           MANIFEST_REPO="${{ github.event.inputs.manifest_repo_url }}"
           DEVICE_REPO="${{ github.event.inputs.device_tree_repo_url }}"
           DEVICE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
-          LUNCH_TARGET="${{ github.event.inputs.lunch_target }}"
+          LUNCH_TARGET="${{ env.LUNCH_TARGET }}"
           
           cd twrp/${{ github.event.inputs.device_tree_path }}
           COMMIT_HASH=$(git log -1 --format="%h")
