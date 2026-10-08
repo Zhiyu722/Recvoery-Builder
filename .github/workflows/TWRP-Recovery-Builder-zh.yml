@@ -100,6 +100,55 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
+      # ====== 激进清理：释放磁盘空间 ======
+      - name: 清理无用文件（释放磁盘空间）
+        run: |
+          echo "===== 清理前磁盘占用 ====="
+          df -h /
+          echo "===== 开始清理 ====="
+
+          # 删除常见大体积预装软件
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/graalvm || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/sbt || true
+          sudo rm -rf /usr/share/miniconda || true
+          sudo rm -rf /usr/local/share/powershell || true
+
+          # 清理 apt 缓存
+          sudo apt clean
+          sudo apt autoremove -y
+
+          # 清理 Docker 镜像（如果存在）
+          sudo rm -rf /usr/share/dotnet/sdk || true
+          sudo rm -rf /var/lib/docker || true
+
+          # 清理临时文件
+          sudo rm -rf /tmp/* || true
+
+          echo "===== 清理后磁盘占用 ====="
+          df -h /
+
+      - name: 设置交换空间
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 24
+
+      # ====== 校验资源情况 ======
+      - name: 检查资源情况
+        run: |
+          echo "===== 内存 ====="
+          free -h
+          echo "===== Swap ====="
+          swapon --show || echo "⚠️ 无 swap"
+          echo "===== 磁盘 ====="
+          df -h /
+
       - name: 设置 ccache 缓存（/tmp 可写）
         uses: actions/cache@v4
         with:
@@ -124,9 +173,6 @@ jobs:
           echo "CCACHE_SLOPPINESS=time_macros,include_file_mtime,file_macro" >> $GITHUB_ENV
           echo "✅ ccache 已配置，缓存目录: $CCACHE_DIR，临时目录: $CCACHE_TEMP"
 
-      - name: 清理磁盘空间
-        uses: rokibhasansagar/slimhub_actions@main
-
       - name: 确定最终使用的 manifest 分支
         id: manifest_branch
         run: |
@@ -142,6 +188,7 @@ jobs:
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "✅ 使用的 manifest 分支: $BRANCH"
 
+      # ====== 自动生成 lunch 目标 ======
       - name: 设置 lunch 目标
         id: lunch_target
         run: |
@@ -201,42 +248,24 @@ jobs:
           cd twrp
           repo sync --force-sync --no-tags --no-clone-bundle -j$(nproc)
 
-      # ====== 只在本次 CI 运行期间临时追加 ap2a-eng 变体 ======
-      - name: 临时追加 ap2a-eng lunch 变体（仅本次构建有效）
-        run: |
-          DEVICE_PATH="${{ github.event.inputs.device_tree_path }}"
-          DEVICE_NAME=$(basename "$DEVICE_PATH")
-          AP_FILE="twrp/${DEVICE_PATH}/AndroidProducts.mk"
-          if [ ! -f "$AP_FILE" ]; then
-            echo "❌ 未找到 $AP_FILE"
-            exit 1
-          fi
-
-          # 备份以防万一（CI 无需保留，仅作可读性）
-          cp "$AP_FILE" "$AP_FILE.ci.bak"
-
-          # 若已存在 ap2a-eng 则不重复添加
-          if grep -q "twrp_${DEVICE_NAME}-ap2a-eng" "$AP_FILE"; then
-            echo "✅ 已存在 ap2a-eng，无需追加"
-          else
-            printf '\nCOMMON_LUNCH_CHOICES += twrp_%s-ap2a-eng\n' "$DEVICE_NAME" >> "$AP_FILE"
-            echo "✅ 已在 CI 中临时追加 twrp_${DEVICE_NAME}-ap2a-eng"
-          fi
-          echo "当前 AndroidProducts.mk（CI 运行时）："
-          cat "$AP_FILE"
-
       - name: 应用展讯DRM显示修复补丁
         if: github.event.inputs.apply_sprd_drm_patch == 'true'
         run: |
           echo "📦 正在克隆展讯DRM补丁仓库..."
           git clone https://github.com/rtyutechstudio/unisoc-twrp-sourcecode_patch.git /tmp/sprd_patch
+          
           TARGET_FILE="twrp/bootable/recovery/minuitwrp/graphics_drm.cpp"
+          
           if [ -f "$TARGET_FILE" ]; then
+            echo "🗑️ 删除原 graphics_drm.cpp..."
             rm -f "$TARGET_FILE"
           else
             echo "⚠️ 警告：原文件不存在，可能路径不正确，请检查设备树配置"
           fi
+          
+          echo "📋 复制修复版 graphics_drm.cpp.sprd_legacy_kms_fixed -> graphics_drm.cpp..."
           cp /tmp/sprd_patch/graphics_drm.cpp.sprd_legacy_kms_fixed "$TARGET_FILE"
+          
           echo "✅ 展讯DRM补丁已应用"
 
       - name: 应用 Himax 触摸屏修复补丁
@@ -244,13 +273,19 @@ jobs:
         run: |
           echo "📦 正在克隆 Himax 触摸补丁仓库..."
           git clone https://github.com/rtyutechstudio/himax_twrp_sourcecode-patch.git /tmp/himax_patch
+          
           TARGET_FILE="twrp/bootable/recovery/minuitwrp/events.cpp"
+          
           if [ -f "$TARGET_FILE" ]; then
+            echo "🗑️ 备份原 events.cpp 为 events.cpp.bak..."
             cp "$TARGET_FILE" "$TARGET_FILE.bak"
           else
             echo "⚠️ 警告：原 events.cpp 不存在，可能路径不正确，请检查设备树配置"
           fi
+          
+          echo "📋 复制修复版 events.cpp ..."
           cp /tmp/himax_patch/events.cpp "$TARGET_FILE"
+          
           echo "✅ Himax 触摸补丁已应用"
 
       - name: 编译 recovery 镜像
@@ -264,7 +299,8 @@ jobs:
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
           export CCACHE_COMPRESS=1
-          mka recoveryimage ALLOW_MISSING_DEPENDENCIES=true
+          # 限制并行度为 2，降低内存峰值
+          mka recoveryimage ALLOW_MISSING_DEPENDENCIES=true -j2
 
       - name: 编译 vendor_boot 镜像
         if: github.event.inputs.build_target == 'vendor_boot'
@@ -277,7 +313,7 @@ jobs:
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
           export CCACHE_COMPRESS=1
-          mka vendorbootimage ALLOW_MISSING_DEPENDENCIES=true
+          mka vendorbootimage ALLOW_MISSING_DEPENDENCIES=true -j2
 
       - name: 编译 boot 镜像
         if: github.event.inputs.build_target == 'boot'
@@ -290,7 +326,7 @@ jobs:
           export CCACHE_TEMPDIR="/tmp/ccache-tmp"
           export USE_CCACHE=1
           export CCACHE_COMPRESS=1
-          mka bootimage ALLOW_MISSING_DEPENDENCIES=true
+          mka bootimage ALLOW_MISSING_DEPENDENCIES=true -j2
 
       - name: 输出 ccache 统计信息
         run: |
@@ -360,27 +396,39 @@ jobs:
           if [ -z "$DEVICE_NAME" ]; then
             DEVICE_NAME="Unknown"
           fi
+          
           BUILD_DATE=$(date +%Y%m%d)
+          
           case "${{ github.event.inputs.build_target }}" in
-            recovery) TARGET_IMG="recovery.img" ;;
-            vendor_boot) TARGET_IMG="vendor_boot.img" ;;
-            boot) TARGET_IMG="boot.img" ;;
+            recovery)
+              TARGET_IMG="recovery.img"
+              ;;
+            vendor_boot)
+              TARGET_IMG="vendor_boot.img"
+              ;;
+            boot)
+              TARGET_IMG="boot.img"
+              ;;
           esac
+          
           BUILD_BRANCH="${{ steps.manifest_branch.outputs.branch }}"
           MANIFEST_REPO="${{ github.event.inputs.manifest_repo_url }}"
           DEVICE_REPO="${{ github.event.inputs.device_tree_repo_url }}"
           DEVICE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
           LUNCH_TARGET="${{ env.LUNCH_TARGET }}"
+          
           cd twrp/${{ github.event.inputs.device_tree_path }}
           COMMIT_HASH=$(git log -1 --format="%h")
           COMMIT_MSG=$(git log -1 --format="%s")
           COMMIT_INFO="${COMMIT_HASH} ${COMMIT_MSG}"
+          
           IMG_FILE="release_assets/${TARGET_IMG}"
           if [ -f "$IMG_FILE" ]; then
             MD5_SUM=$(md5sum "$IMG_FILE" | cut -d' ' -f1)
           else
             MD5_SUM="未找到文件"
           fi
+          
           cat <<EOF > release_body.txt
           ## Unofficial TWRP for ${DEVICE_NAME} // ${BUILD_DATE}
           
@@ -393,6 +441,7 @@ jobs:
           
           > 此构建由 GitHub Actions 自动生成，仅供测试使用。
           EOF
+          
           echo "✅ Release 说明已生成："
           cat release_body.txt
 
@@ -402,6 +451,7 @@ jobs:
         with:
           tag_name: twrp-build-${{ github.run_id }}
           name: "TWRP Build ${{ github.run_id }}"
+          body: release_body.txt
           body_path: release_body.txt
           draft: false
           prerelease: true
