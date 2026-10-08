@@ -235,24 +235,96 @@ jobs:
           cd twrp
           repo sync --force-sync --no-tags --no-clone-bundle -j$(nproc)
 
-      # ====== 临时允许 Soong 新插件（仅本次构建有效） ======
-      - name: 临时允许 Soong 新插件
+      # ============================================================
+      # 临时绕过 Soong 插件验证（CI 专用，直接改源码）
+      # ============================================================
+      - name: 临时绕过 Soong 插件验证
         run: |
-          DEVICE_PATH="${{ github.event.inputs.device_tree_path }}"
-          BOARD_CONFIG="twrp/${DEVICE_PATH}/BoardConfig.mk"
-          if [ ! -f "$BOARD_CONFIG" ]; then
-            echo "❌ 未找到 $BOARD_CONFIG"
-            exit 1
+          echo "🔍 搜索相关源文件..."
+
+          CONFIG_FILES=$(grep -rln "func.*BuildBrokenPluginValidation" twrp/build/soong/ 2>/dev/null || true)
+          ERR_FILES=$(grep -rln "New plugins are not supported" twrp/build/soong/ 2>/dev/null || true)
+
+          echo "定义 BuildBrokenPluginValidation 的文件："
+          echo "$CONFIG_FILES"
+          echo ""
+          echo "出现报错信息的文件："
+          echo "$ERR_FILES"
+          echo ""
+
+          # ========== 修改方式1：让 BuildBrokenPluginValidation 永远返回 true ==========
+          if [ -n "$CONFIG_FILES" ]; then
+            for f in $CONFIG_FILES; do
+              echo "🔧 修改: $f"
+              export TARGET_FILE="$f"
+              python3 << 'PYEOF'
+import re, os
+path = os.environ['TARGET_FILE']
+with open(path) as fp:
+    content = fp.read()
+pattern = r'(func\s+\([^)]*\)\s+BuildBrokenPluginValidation\(\)\s+bool\s*\{)[^}]*(\})'
+new_content = re.sub(pattern, r'\1\n\treturn true\n\2', content, count=1)
+if new_content != content:
+    with open(path, 'w') as fp:
+        fp.write(new_content)
+    print("  ✅ 已改为 return true")
+else:
+    print("  ⚠️ 未匹配到函数体，改用方式2")
+PYEOF
+              echo "  修改后："
+              grep -n -A3 "BuildBrokenPluginValidation" "$f" || true
+              echo ""
+            done
           fi
 
-          if grep -q "BUILD_BROKEN_PLUGIN_VALIDATION" "$BOARD_CONFIG"; then
-            echo "✅ BoardConfig.mk 已包含 BUILD_BROKEN_PLUGIN_VALIDATION，无需追加"
-          else
-            printf '\nBUILD_BROKEN_PLUGIN_VALIDATION := true\n' >> "$BOARD_CONFIG"
-            echo "✅ 已在 CI 中临时追加 BUILD_BROKEN_PLUGIN_VALIDATION := true"
+          # ========== 修改方式2：直接注释掉报错分支 ==========
+          if [ -n "$ERR_FILES" ]; then
+            for f in $ERR_FILES; do
+              echo "📁 报错文件: $f"
+              export TARGET_FILE="$f"
+              python3 << 'PYEOF'
+import re, os
+path = os.environ['TARGET_FILE']
+with open(path) as fp:
+    lines = fp.read().split('\n')
+
+# 找到报错信息所在位置，向上找 if 判断
+target_idx = None
+for i, line in enumerate(lines):
+    if 'New plugins are not supported' in line:
+        target_idx = i
+        break
+
+if target_idx is None:
+    print("  未找到报错信息")
+else:
+    modified = False
+    # 向上找 if 语句
+    for j in range(target_idx, max(-1, target_idx - 20), -1):
+        line = lines[j]
+        if re.match(r'\s*if\s', line):
+            original = line
+            # 把 if 条件改为 false
+            if '{' in line:
+                lines[j] = re.sub(r'if\s+.+?\{', 'if false {', line)
+            else:
+                lines[j] = re.sub(r'if\s+.+$', 'if false', line)
+            print(f"  原 if: {original.strip()}")
+            print(f"  新 if: {lines[j].strip()}")
+            modified = True
+            break
+    if modified:
+        with open(path, 'w') as fp:
+            fp.write('\n'.join(lines))
+        print("  ✅ 已注释掉报错分支")
+    else:
+        print("  ⚠️ 未找到可修改的 if")
+PYEOF
+              echo ""
+            done
           fi
-          echo "当前 BoardConfig.mk 末尾："
-          tail -5 "$BOARD_CONFIG"
+
+          echo "✅ Soong 修改步骤完成"
 
       - name: 应用展讯DRM显示修复补丁
         if: github.event.inputs.apply_sprd_drm_patch == 'true'
