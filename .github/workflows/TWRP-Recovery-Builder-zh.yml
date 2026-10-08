@@ -6,22 +6,29 @@ on:
       manifest_repo_url:
         description: 'TWRP manifest 仓库地址'
         required: true
-        default: 'https://github.com/nebrassy/platform_manifest_twrp_aosp.git'
+        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git'
         type: choice
         options:
-          - https://github.com/nebrassy/platform_manifest_twrp_aosp.git
           - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git
+          - https://github.com/minimal-manifest-twrp/platform_manifest_twrp_omni.git
 
       manifest_branch_preset:
         description: '选择常用的 manifest 分支（若选“自定义”，请在下方输入）'
         required: true
-        default: 'twrp-14'
+        default: 'twrp-12.1'
         type: choice
         options:
+          - twrp-14.1
           - twrp-14
           - twrp-12.1
           - twrp-11
           - twrp-10.0-deprecated
+          - twrp-9.0
+          - twrp-8.1
+          - twrp-7.1
+          - twrp-6.0
+          - twrp-5.1
+          - twrp-4.4-deprecated
           - 自定义
 
       manifest_branch_custom:
@@ -91,9 +98,9 @@ jobs:
         uses: actions/checkout@v4
 
       # ============================================================
-      # Set up job：安装依赖 + 清理磁盘 + 检查资源
+      # Setup Build Environment：安装依赖 + 清理磁盘 + 检查资源
       # ============================================================
-      - name: Set up job
+      - name: Setup Build Environment
         run: |
           echo "===== 安装编译依赖 ====="
           sudo apt update
@@ -147,9 +154,9 @@ jobs:
             ${{ runner.os }}-ccache-
 
       # ============================================================
-      # Configure build：配置 ccache + 确定分支 + 设置 lunch
+      # Configure Build：配置 ccache + 确定分支 + 设置 lunch
       # ============================================================
-      - name: Configure build
+      - name: Configure Build
         id: config
         run: |
           # ----- 配置 ccache -----
@@ -252,7 +259,8 @@ jobs:
           echo "$ERR_FILES"
           echo ""
 
-          # ========== 修改方式1：让 BuildBrokenPluginValidation 永远返回 true ==========
+          SKIP_FALLBACK=""
+
           if [ -n "$CONFIG_FILES" ]; then
             for f in $CONFIG_FILES; do
               echo "🔧 修改: $f"
@@ -275,10 +283,10 @@ PYEOF
               grep -n -A3 "BuildBrokenPluginValidation" "$f" || true
               echo ""
             done
+            SKIP_FALLBACK="1"
           fi
 
-          # ========== 修改方式2：直接注释掉报错分支 ==========
-          if [ -n "$ERR_FILES" ]; then
+          if [ -z "$SKIP_FALLBACK" ] && [ -n "$ERR_FILES" ]; then
             for f in $ERR_FILES; do
               echo "📁 报错文件: $f"
               export TARGET_FILE="$f"
@@ -288,7 +296,6 @@ path = os.environ['TARGET_FILE']
 with open(path) as fp:
     lines = fp.read().split('\n')
 
-# 找到报错信息所在位置，向上找 if 判断
 target_idx = None
 for i, line in enumerate(lines):
     if 'New plugins are not supported' in line:
@@ -299,12 +306,10 @@ if target_idx is None:
     print("  未找到报错信息")
 else:
     modified = False
-    # 向上找 if 语句
     for j in range(target_idx, max(-1, target_idx - 20), -1):
         line = lines[j]
         if re.match(r'\s*if\s', line):
             original = line
-            # 把 if 条件改为 false
             if '{' in line:
                 lines[j] = re.sub(r'if\s+.+?\{', 'if false {', line)
             else:
