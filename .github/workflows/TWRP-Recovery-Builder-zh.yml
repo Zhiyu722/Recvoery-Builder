@@ -419,31 +419,28 @@ jobs:
           DEVICE_BRANCH="${{ github.event.inputs.device_tree_branch }}"
           LUNCH_TARGET="${{ env.LUNCH_TARGET }}"
 
-          cd twrp/${{ github.event.inputs.device_tree_path }}
-          COMMIT_HASH=$(git log -1 --format="%h")
-          COMMIT_MSG=$(git log -1 --format="%s")
-          COMMIT_INFO="${COMMIT_HASH} ${COMMIT_MSG}"
+          COMMIT_INFO=$(cd twrp/${{ github.event.inputs.device_tree_path }} && git log -1 --format="%h %s")
 
-          IMG_FILE="release_assets/${TARGET_IMG}"
+          IMG_FILE="${{ github.workspace }}/release_assets/${TARGET_IMG}"
           if [ -f "$IMG_FILE" ]; then
             MD5_SUM=$(md5sum "$IMG_FILE" | cut -d' ' -f1)
           else
             MD5_SUM="未找到文件"
           fi
 
-          echo "## Unofficial TWRP for ${DEVICE_NAME} // ${BUILD_DATE}" > release_body.txt
-          echo "" >> release_body.txt
-          echo "**Target:** \`${TARGET_IMG}\`" >> release_body.txt
-          echo "**Manifest:** \`${MANIFEST_REPO}\` (\`${BUILD_BRANCH}\`)" >> release_body.txt
-          echo "**Device Tree:** \`${DEVICE_REPO}\` (\`${DEVICE_BRANCH}\`)" >> release_body.txt
-          echo "**Lunch Target:** \`${LUNCH_TARGET}\`" >> release_body.txt
-          echo "**Commit:** \`${COMMIT_INFO}\`" >> release_body.txt
-          echo "**MD5 (${TARGET_IMG}):** \`${MD5_SUM}\`" >> release_body.txt
-          echo "" >> release_body.txt
-          echo "> 此构建由 GitHub Actions 自动生成，仅供测试使用。" >> release_body.txt
+          echo "## Unofficial TWRP for ${DEVICE_NAME} // ${BUILD_DATE}" > ${{ github.workspace }}/release_body.txt
+          echo "" >> ${{ github.workspace }}/release_body.txt
+          echo "**Target:** \`${TARGET_IMG}\`" >> ${{ github.workspace }}/release_body.txt
+          echo "**Manifest:** \`${MANIFEST_REPO}\` (\`${BUILD_BRANCH}\`)" >> ${{ github.workspace }}/release_body.txt
+          echo "**Device Tree:** \`${DEVICE_REPO}\` (\`${DEVICE_BRANCH}\`)" >> ${{ github.workspace }}/release_body.txt
+          echo "**Lunch Target:** \`${LUNCH_TARGET}\`" >> ${{ github.workspace }}/release_body.txt
+          echo "**Commit:** \`${COMMIT_INFO}\`" >> ${{ github.workspace }}/release_body.txt
+          echo "**MD5 (${TARGET_IMG}):** \`${MD5_SUM}\`" >> ${{ github.workspace }}/release_body.txt
+          echo "" >> ${{ github.workspace }}/release_body.txt
+          echo "> 此构建由 GitHub Actions 自动生成，仅供测试使用。" >> ${{ github.workspace }}/release_body.txt
 
           echo "✅ Release 说明已生成："
-          cat release_body.txt
+          cat ${{ github.workspace }}/release_body.txt
 
       - name: 创建 GitHub Release 并上传产物
         if: github.event.inputs.upload_release == 'true'
@@ -451,8 +448,8 @@ jobs:
         with:
           tag_name: twrp-build-${{ github.run_id }}
           name: "TWRP Build ${{ github.run_id }}"
-          body_path: release_body.txt
+          body_path: ${{ github.workspace }}/release_body.txt
           draft: false
           prerelease: true
-          files: release_assets/*
+          files: ${{ github.workspace }}/release_assets/*
           fail_on_unmatched_files: false
