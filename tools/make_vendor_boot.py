@@ -72,6 +72,8 @@ def main():
     ap.add_argument("--cmdline", default=None, help="默认沿用原厂 cmdline")
     ap.add_argument("--selinux-permissive", action="store_true",
                     help="在 cmdline 末尾追加 androidboot.selinux=permissive")
+    ap.add_argument("--pad-to", type=int, default=104857600,
+                    help="末尾补零到该字节数，默认 104857600(=BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE)；0=不补")
     a = ap.parse_args()
 
     if a.ramdisk_lz4 and (a.platform_lz4 or a.recovery_lz4):
@@ -129,6 +131,12 @@ def main():
     out += st["bootconfig"]
     out += b"\x00" * (al(len(out)) - len(out))
 
+    content = len(out)
+    if a.pad_to:
+        if content > a.pad_to:
+            sys.exit(f"内容 {content}B 已超过 --pad-to {a.pad_to}")
+        out += b"\x00" * (a.pad_to - content)
+
     with open(a.out, "wb") as fp:
         fp.write(out)
 
@@ -136,7 +144,10 @@ def main():
     print(f"bootconfig({st['bcsz']}B): {st['bootconfig']!r}")
     for f in frags:
         print(f"frag type={f['type']} name={f['name'] or '-'} size={len(f['data'])}B")
-    print(f"dtb: {st['dtbsz']}B  wrote {a.out} {len(out)}B")
+    print(f"dtb: {st['dtbsz']}B")
+    print(f"content {content}B"
+          + (f" -> padded to {len(out)}B (zeros {len(out) - content}B)" if a.pad_to else " (no padding)")
+          + f"  wrote {a.out}")
 
 
 if __name__ == "__main__":

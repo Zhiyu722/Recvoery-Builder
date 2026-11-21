@@ -11,6 +11,7 @@
 #
 # 环境变量：
 #   PERMISSIVE=0   不追加 androidboot.selinux=permissive（默认追加，和 TWRP 现行行为一致）
+#   PAD_TO=<bytes> 末尾补零到该大小，默认 104857600（= BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE）；0=不补
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,6 +45,7 @@ python3 "$ROOT/tools/make_vendor_boot.py" \
   --stock "$STOCK" \
   --recovery-lz4 "$WORK/recovery.lz4" \
   --out "$WORK/vendor_boot_fixed.img" \
+  --pad-to "${PAD_TO:-104857600}" \
   "${EXTRA[@]}"
 
 echo "== 校验 =="
