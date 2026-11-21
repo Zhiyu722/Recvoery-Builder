@@ -103,7 +103,7 @@ jobs:
           sudo apt install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
             gcc-multilib g++-multilib libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev \
             libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-            python3 python3-pip repo ccache
+            python3 python3-pip repo ccache lz4 cpio
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
@@ -330,6 +330,14 @@ jobs:
           export USE_CCACHE=1
           export CCACHE_COMPRESS=1
           mka bootimage ALLOW_MISSING_DEPENDENCIES=true -j2
+
+      - name: 修复 vendor_boot 打包（platform=原厂 / recovery=TWRP）
+        if: github.event.inputs.build_target == 'vendor_boot'
+        run: |
+          set -e
+          IMG=$(ls twrp/out/target/product/*/vendor_boot.img | head -n1)
+          echo "构建产物: $IMG"
+          bash "${{ github.workspace }}/tools/repack_vendor_boot.sh" "$IMG"
 
       - name: 输出 ccache 统计信息
         run: |
