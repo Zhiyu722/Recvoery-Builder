@@ -1,153 +1,124 @@
 #!/usr/bin/env python3
-"""按原厂 vendor_boot 头重打包；支持 platform / recovery 双片段 (header v4)。
+"""Repack an Android vendor_boot image (header v3/v4) for any device.
 
-  # 单片段：platform 片段用给定 ramdisk（临时验证用）
-  python3 make_vendor_boot.py --stock vb_a.img --ramdisk-lz4 twrp.lz4 --out o.img
+The template image supplies header fields, cmdline, dtb and bootconfig.
+Fragments from the template are kept unless replaced or dropped.
 
-  # 正常方案：platform=原厂 ramdisk（系统启动），recovery=TWRP ramdisk
-  python3 make_vendor_boot.py --stock vb_a.img --recovery-lz4 twrp.lz4 --out o.img
+Examples:
+  # dual fragment: stock platform + built recovery
+  make_vendor_boot.py --template stock_vb.img --recovery-lz4 twrp.lz4 -o out.img
 
-  # 显式指定 platform 片段
-  python3 make_vendor_boot.py --stock vb_a.img --platform-lz4 p.lz4 --recovery-lz4 r.lz4 --out o.img
+  # single fragment: use the given ramdisk as platform, drop everything else
+  make_vendor_boot.py --template built_vb.img --ramdisk-lz4 ramdisk.lz4 -o out.img
 
-头/表/dtb/bootconfig 全部沿用原厂镜像；片段表按 type=1 platform、type=2 recovery 重写。
+  # replace by type number or name, keep all other stock fragments
+  make_vendor_boot.py --template vb.img --fragment dlkm=dlkm.lz4 -o out.img
+
+Header v3 has no fragment table: only one ramdisk can be written.
 """
 import argparse
-import struct
 import sys
+from pathlib import Path
 
-PS = 4096
+import vendor_boot_lib as vbl
+
 LZ4_MAGIC = b"\x02\x21\x4c\x18"
 
 
-def al(x):
-    return (x + PS - 1) // PS * PS
-
-
-def parse(st):
-    if st[:8] != b"VNDRBOOT":
-        sys.exit("stock 不是 VNDRBOOT")
-    hver, ps = struct.unpack_from("<II", st, 8)
-    hsz, dtbsz = struct.unpack_from("<II", st, 2096)
-    dtbaddr = struct.unpack_from("<Q", st, 2104)[0]
-    tsz, num, esz, bcsz = struct.unpack_from("<IIII", st, 2112)
-
-    cmd = st[28:2076].split(b"\x00")[0].decode()
-    rd_off = al(hsz)
-    rd_size = struct.unpack_from("<I", st, 24)[0]
-    dtb_off = rd_off + al(rd_size)
-    tb_off = dtb_off + al(dtbsz)
-    bc_off = tb_off + al(tsz)
-
-    frags = []
-    for i in range(num):
-        e = tb_off + i * esz
-        sz, off, typ = struct.unpack_from("<III", st, e)
-        name = st[e + 12:e + 44].split(b"\x00")[0].decode()
-        frags.append({"size": sz, "off": off, "type": typ, "name": name,
-                      "data": st[rd_off + off:rd_off + off + sz]})
-
-    return {
-        "hver": hver, "ps": ps, "hsz": hsz, "cmd": cmd, "dtbsz": dtbsz,
-        "dtbaddr": dtbaddr, "dtb": st[dtb_off:dtb_off + dtbsz],
-        "rd_size": rd_size, "tsz": tsz, "num": num, "esz": esz,
-        "bcsz": bcsz, "bootconfig": st[bc_off:bc_off + bcsz], "frags": frags,
-    }
-
-
 def read_lz4(path):
-    d = open(path, "rb").read()
-    if d[:4] != LZ4_MAGIC:
-        sys.exit(f"{path} 不是 lz4 legacy 帧（需要 lz4 -l）")
-    return d
+    try:
+        data = Path(path).read_bytes()
+    except OSError as e:
+        sys.exit(f"{path}: {e}")
+    if data[:4] != LZ4_MAGIC:
+        sys.exit(f"{path}: not an lz4 legacy frame (compress with lz4 -l)")
+    return data
+
+
+def parse_fragment_arg(value):
+    if "=" not in value:
+        sys.exit(f"--fragment expects TYPE=PATH, got {value!r}")
+    ftype, path = value.split("=", 1)
+    try:
+        ftype = vbl.type_id(ftype)
+    except ValueError as e:
+        sys.exit(str(e))
+    return ftype, read_lz4(path)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--stock", required=True, help="原厂 vendor_boot（头/表/dtb/bootconfig 来源）")
-    ap.add_argument("--ramdisk-lz4", default=None, help="单片段模式：platform 片段内容")
-    ap.add_argument("--platform-lz4", default=None, help="platform 片段内容（默认=原厂片段）")
-    ap.add_argument("--recovery-lz4", default=None, help="recovery 片段内容（给出则生成双片段）")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--cmdline", default=None, help="默认沿用原厂 cmdline")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--template", "--stock", dest="template", required=True,
+                    help="vendor_boot used for header/cmdline/dtb/bootconfig and kept fragments")
+    ap.add_argument("--ramdisk-lz4", help="replace ALL fragments with this platform ramdisk")
+    ap.add_argument("--platform-lz4", help="replace/create the platform (type 1) fragment")
+    ap.add_argument("--recovery-lz4", help="replace/create the recovery (type 2) fragment")
+    ap.add_argument("--dlkm-lz4", help="replace/create the dlkm (type 3) fragment")
+    ap.add_argument("--fragment", action="append", default=[], metavar="TYPE=PATH",
+                    help="replace/create any fragment; TYPE may be 1/2/3 or platform/recovery/dlkm")
+    ap.add_argument("--drop", action="append", default=[], metavar="TYPE",
+                    help="drop fragments of this type")
+    ap.add_argument("--cmdline", help="override the cmdline (default: keep template)")
     ap.add_argument("--selinux-permissive", action="store_true",
-                    help="在 cmdline 末尾追加 androidboot.selinux=permissive")
-    ap.add_argument("--pad-to", type=int, default=104857600,
-                    help="末尾补零到该字节数，默认 104857600(=BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE)；0=不补")
+                    help="append androidboot.selinux=permissive if not present")
+    ap.add_argument("--pad-to", type=int, default=0,
+                    help="pad output with zeros to this many bytes (default: 0 = no padding)")
+    ap.add_argument("-o", "--out", required=True)
     a = ap.parse_args()
 
-    if a.ramdisk_lz4 and (a.platform_lz4 or a.recovery_lz4):
-        sys.exit("--ramdisk-lz4 与 --platform-lz4/--recovery-lz4 不能混用")
+    try:
+        img = vbl.parse(Path(a.template).read_bytes())
+    except ValueError as e:
+        sys.exit(f"{a.template}: {e}")
 
-    st = parse(open(a.stock, "rb").read())
-    if st["ps"] != PS:
-        sys.exit(f"pagesize {st['ps']} != {PS}，脚本需调整")
-    if st["hsz"] != 2128:
-        sys.exit(f"header_size {st['hsz']} 非 v4 标准值")
-
-    stock_platform = next((f["data"] for f in st["frags"] if f["type"] == 1), None)
-    if stock_platform is None:
-        sys.exit("原厂镜像里没有 type=1 platform 片段")
+    fragments = [dict(f) for f in img.fragments]
 
     if a.ramdisk_lz4:
-        frags = [{"type": 1, "name": "", "data": read_lz4(a.ramdisk_lz4)}]
+        if a.platform_lz4 or a.recovery_lz4 or a.dlkm_lz4 or a.fragment:
+            sys.exit("--ramdisk-lz4 cannot be combined with other fragment options")
+        fragments = [{"type": 1, "name": "", "board_id": b"\x00" * vbl.BOARD_ID_SIZE,
+                      "data": read_lz4(a.ramdisk_lz4)}]
     else:
-        plat = read_lz4(a.platform_lz4) if a.platform_lz4 else stock_platform
-        frags = [{"type": 1, "name": "", "data": plat}]
-        if a.recovery_lz4:
-            frags.append({"type": 2, "name": "recovery",
-                          "data": read_lz4(a.recovery_lz4)})
+        for ftype, path in ((1, a.platform_lz4), (2, a.recovery_lz4), (3, a.dlkm_lz4)):
+            if path:
+                vbl.set_fragment(fragments, ftype, read_lz4(path))
+        for value in a.fragment:
+            ftype, data = parse_fragment_arg(value)
+            vbl.set_fragment(fragments, ftype, data)
+        for value in a.drop:
+            try:
+                fragments = vbl.drop_type(fragments, value)
+            except ValueError as e:
+                sys.exit(str(e))
 
-    cmd = (a.cmdline or st["cmd"]).encode()
-    if a.selinux_permissive and b"androidboot.selinux" not in cmd:
-        cmd += b" androidboot.selinux=permissive"
-    if len(cmd) >= 2048:
-        sys.exit("cmdline 超长")
+    if img.version == 3 and len(fragments) != 1:
+        sys.exit("header v3 supports a single vendor ramdisk; "
+                 "only --ramdisk-lz4 / --platform-lz4 is valid")
 
-    total = sum(len(f["data"]) for f in frags)
-    hdr = bytearray(open(a.stock, "rb").read()[:st["hsz"]])
-    struct.pack_into("<I", hdr, 24, total)
-    hdr[28:2076] = cmd.ljust(2048, b"\x00")
-    struct.pack_into("<I", hdr, 2100, st["dtbsz"])
-    struct.pack_into("<Q", hdr, 2104, st["dtbaddr"])
+    cmdline = img.cmdline
+    if a.cmdline is not None:
+        cmdline = a.cmdline.encode()
+    if a.selinux_permissive and b"androidboot.selinux" not in cmdline:
+        cmdline += b" androidboot.selinux=permissive"
 
-    table = b""
-    off = 0
-    for f in frags:
-        table += struct.pack("<III", len(f["data"]), off, f["type"])
-        table += f["name"].encode().ljust(32, b"\x00") + b"\x00" * 64
-        off += len(f["data"])
-    struct.pack_into("<IIII", hdr, 2112, len(table), len(frags), 108, st["bcsz"])
+    try:
+        out, content = vbl.build(img, fragments, cmdline=cmdline, pad_to=a.pad_to)
+    except ValueError as e:
+        sys.exit(str(e))
+    Path(a.out).write_bytes(out)
 
-    out = bytearray(al(st["hsz"]))
-    out[:st["hsz"]] = hdr
-    for f in frags:
-        out += f["data"]
-    out += b"\x00" * (al(len(out)) - len(out))
-    out += st["dtb"]
-    out += b"\x00" * (al(len(out)) - len(out))
-    out += table
-    out += b"\x00" * (al(len(out)) - len(out))
-    out += st["bootconfig"]
-    out += b"\x00" * (al(len(out)) - len(out))
-
-    content = len(out)
-    if a.pad_to:
-        if content > a.pad_to:
-            sys.exit(f"内容 {content}B 已超过 --pad-to {a.pad_to}")
-        out += b"\x00" * (a.pad_to - content)
-
-    with open(a.out, "wb") as fp:
-        fp.write(out)
-
-    print(f"cmdline : {cmd.decode()}")
-    print(f"bootconfig({st['bcsz']}B): {st['bootconfig']!r}")
-    for f in frags:
-        print(f"frag type={f['type']} name={f['name'] or '-'} size={len(f['data'])}B")
-    print(f"dtb: {st['dtbsz']}B")
-    print(f"content {content}B"
-          + (f" -> padded to {len(out)}B (zeros {len(out) - content}B)" if a.pad_to else " (no padding)")
-          + f"  wrote {a.out}")
+    print(f"template : {a.template} (header v{img.version}, page {img.page_size}, "
+          f"{len(img.fragments)} fragment(s))")
+    print(f"cmdline  : {cmdline.decode(errors='replace')}")
+    if img.version == 4:
+        print(f"bootconfig: {img.bootconfig!r}")
+    for f in fragments:
+        print(f"fragment : type={f['type']}({vbl.TYPE_NAMES.get(f['type'], '?')}) "
+              f"name={f['name'] or '-'} size={len(f['data'])}B")
+    print(f"content  : {content}B"
+          + (f" -> {len(out)}B (zero padding {len(out) - content}B)" if a.pad_to else "")
+          + f" -> {a.out}")
 
 
 if __name__ == "__main__":

@@ -37,9 +37,9 @@ on:
         default: ''
 
       device_tree_repo_url:
-        description: '设备树 GitHub 仓库地址'
+        description: '设备树仓库地址（任意 git 仓库，不要填示例）'
         required: true
-        default: 'https://gitee.com/cuoxianxu/x5pro-twrp-treetest1.git'
+        default: ''
         type: string
       device_tree_branch:
         description: '设备树分支'
@@ -47,9 +47,9 @@ on:
         default: 'master'
         type: string
       device_tree_path:
-        description: '设备树在源码中的存放路径（如 device/EEBBK/P24NH280）'
+        description: '设备树在源码中的存放路径（如 device/<厂商>/<机型>）'
         required: true
-        default: 'device/EEBBK/P24NH280'
+        default: ''
         type: string
 
       build_target:
@@ -61,6 +61,32 @@ on:
           - recovery
           - vendor_boot
           - boot
+
+      vendor_boot_repack:
+        description: 'vendor_boot 重打包布局：auto=有原厂镜像就双片段，否则单片段；off=不处理'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - dual
+          - single
+          - off
+      stock_vendor_boot:
+        description: '原厂 vendor_boot：URL 或仓库/工作区路径；留空则用设备树 prebuilt/vendor_boot_stock.img'
+        required: false
+        default: ''
+        type: string
+      vendor_boot_pad_to:
+        description: '补零到分区大小：auto=读 BoardConfig.mk，0=不补，或直接填字节数'
+        required: true
+        default: 'auto'
+        type: string
+      vendor_boot_permissive:
+        description: '在 cmdline 追加 androidboot.selinux=permissive'
+        required: true
+        default: false
+        type: boolean
 
       upload_zip:
         description: '是否上传 ZIP 刷机包（作为 Artifact）'
@@ -96,6 +122,15 @@ jobs:
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+
+      - name: 校验必填输入
+        run: |
+          [ -n "${{ github.event.inputs.device_tree_repo_url }}" ] || { echo "::error::device_tree_repo_url 不能为空"; exit 1; }
+          [ -n "${{ github.event.inputs.device_tree_path }}" ] || { echo "::error::device_tree_path 不能为空"; exit 1; }
+          PAD="${{ github.event.inputs.vendor_boot_pad_to }}"
+          if [ "$PAD" != "auto" ] && ! [[ "$PAD" =~ ^[0-9]+$ ]]; then
+            echo "::error::vendor_boot_pad_to 必须是 auto、0 或字节数"; exit 1
+          fi
 
       - name: 准备编译环境
         run: |
@@ -331,12 +366,47 @@ jobs:
           export CCACHE_COMPRESS=1
           mka bootimage ALLOW_MISSING_DEPENDENCIES=true -j2
 
-      - name: 修复 vendor_boot 打包（platform=原厂 / recovery=TWRP）
-        if: github.event.inputs.build_target == 'vendor_boot'
+      - name: 准备原厂 vendor_boot（可选）
+        if: github.event.inputs.build_target == 'vendor_boot' && github.event.inputs.vendor_boot_repack != 'off'
+        env:
+          STOCK_INPUT: ${{ github.event.inputs.stock_vendor_boot }}
+          DEVICE_TREE_DIR: ${{ github.workspace }}/twrp/${{ github.event.inputs.device_tree_path }}
+        run: |
+          set -euo pipefail
+          stock=""
+          if [ -n "$STOCK_INPUT" ]; then
+            case "$STOCK_INPUT" in
+              http://*|https://*)
+                curl -fL --retry 3 -o "$RUNNER_TEMP/vendor_boot_stock.img" "$STOCK_INPUT"
+                stock="$RUNNER_TEMP/vendor_boot_stock.img"
+                ;;
+              *)
+                [ -f "$STOCK_INPUT" ] || { echo "::error::找不到原厂 vendor_boot: $STOCK_INPUT"; exit 1; }
+                stock=$(realpath "$STOCK_INPUT")
+                ;;
+            esac
+          elif [ -f "$DEVICE_TREE_DIR/prebuilt/vendor_boot_stock.img" ]; then
+            stock="$DEVICE_TREE_DIR/prebuilt/vendor_boot_stock.img"
+          fi
+          echo "STOCK_VENDOR_BOOT=$stock" >> "$GITHUB_ENV"
+          if [ -n "$stock" ]; then
+            echo "原厂 vendor_boot: $stock"
+            python3 tools/check_vendor_boot.py "$stock" || true
+          else
+            echo "未提供原厂 vendor_boot：dual 模式不可用，auto 将退化为 single"
+          fi
+
+      - name: 重打包 vendor_boot（布局可配置）
+        if: github.event.inputs.build_target == 'vendor_boot' && github.event.inputs.vendor_boot_repack != 'off'
+        env:
+          MODE: ${{ github.event.inputs.vendor_boot_repack }}
+          PAD_TO: ${{ github.event.inputs.vendor_boot_pad_to }}
+          PERMISSIVE: ${{ github.event.inputs.vendor_boot_permissive == 'true' && '1' || '0' }}
+          DEVICE_TREE: ${{ github.workspace }}/twrp/${{ github.event.inputs.device_tree_path }}
         run: |
           set -e
           IMG=$(ls twrp/out/target/product/*/vendor_boot.img | head -n1)
-          echo "构建产物: $IMG"
+          echo "构建产物: $IMG (MODE=$MODE PAD_TO=$PAD_TO)"
           bash "${{ github.workspace }}/tools/repack_vendor_boot.sh" "$IMG"
 
       - name: 输出 ccache 统计信息

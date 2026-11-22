@@ -1,111 +1,126 @@
 #!/usr/bin/env python3
-"""vendor_boot 打包自检。
+"""Validate Android vendor_boot images (header v3/v4).
 
-  python3 check_vendor_boot.py <vendor_boot.img>...
-  python3 check_vendor_boot.py --stock vb_a.img <vendor_boot.img>   # 额外比对 platform 片段是否与原厂逐字节一致
+  check_vendor_boot.py img.img [img2.img ...]
+  check_vendor_boot.py --stock stock.img img.img     # also compare platform fragment
+  check_vendor_boot.py --expect-platform-md5 MD5 img.img
 
-判据：platform 片段非空(>1MB) / bootconfig 含 androidboot.hardware / cmdline 保留 bootconfig /
-片段表自洽（偏移连续、总长等于 vendor_ramdisk_size）。退出码 0=全部 OK。
+Exit code 0 when every image is structurally valid, 1 otherwise.
+Warnings (missing bootconfig, missing recovery fragment, small platform, ...)
+do not fail the check; use --require-platform to make one of them fatal.
 """
+import argparse
 import hashlib
 import struct
 import sys
+from pathlib import Path
 
-TYPES = {0: "none", 1: "platform", 2: "recovery", 3: "dlkm"}
-
-
-def al(x, ps):
-    return (x + ps - 1) // ps * ps
+import vendor_boot_lib as vbl
 
 
-def parse(d):
-    hver, ps = struct.unpack_from("<II", d, 8)
-    vrs = struct.unpack_from("<I", d, 24)[0]
-    hsz, dtbsz = struct.unpack_from("<II", d, 2096)
-    tsz, num, esz, bcsz = struct.unpack_from("<IIII", d, 2112)
-    cmd = d[28:2076].split(b"\x00")[0].decode("ascii", "replace")
-    base = al(hsz, ps)
-    tbl = base + al(vrs, ps) + al(dtbsz, ps)
-    frags = []
-    for i in range(num):
-        o = tbl + i * esz
-        sz, off, ty = struct.unpack_from("<III", d, o)
-        nm = d[o + 12:o + 44].split(b"\x00")[0].decode("ascii", "replace")
-        frags.append({"type": ty, "size": sz, "off": off, "name": nm,
-                      "md5": hashlib.md5(d[base + off:base + off + sz]).hexdigest()})
-    bc = d[tbl + al(tsz, ps):tbl + al(tsz, ps) + bcsz] if bcsz else b""
-    return dict(hver=hver, ps=ps, vrs=vrs, cmd=cmd, bcsz=bcsz, bc=bc, frags=frags)
-
-
-def check(path, stock_md5=None):
-    d = open(path, "rb").read()
-    if d[:8] != b"VNDRBOOT":
-        print(f"== {path}\nFAIL 不是 vendor_boot 镜像")
+def check(path, stock_md5=None, expect_md5=None, require_platform=False, quiet=False):
+    problems = []
+    warnings = []
+    try:
+        data = Path(path).read_bytes()
+        img = vbl.parse(data)
+    except (OSError, ValueError) as e:
+        print(f"== {path}\nFAIL  {e}")
         return False
-    i = parse(d)
-    ok = True
+
     print(f"== {path}")
-    print(f"header v{i['hver']} pagesize {i['ps']} vendor_ramdisk_size {i['vrs']} "
-          f"bootconfig {i['bcsz']}B")
-    print(f"cmdline: {i['cmd']}")
+    frag_total = sum(len(f["data"]) for f in img.fragments)
+    print(f"header v{img.version} page_size {img.page_size} "
+          f"vendor_ramdisk_size {img.ramdisk_size}B (fragments {frag_total}B) "
+          f"dtb {img.dtb_size}B bootconfig {len(img.bootconfig)}B")
+    if img.version == 4 and frag_total > img.ramdisk_size:
+        problems.append("fragments overlap or exceed vendor_ramdisk_size")
+    elif img.version == 4 and frag_total < img.ramdisk_size:
+        warnings.append("vendor ramdisk has unused tail bytes")
+    print(f"cmdline: {img.cmdline.decode(errors='replace')}")
 
-    if "bootconfig" not in i["cmd"]:
-        print("WARN  cmdline 里没有 bootconfig token（原厂是 'console=... bootconfig bootconfig'）")
-    if i["bcsz"] == 0:
-        print("FAIL  bootconfig 为空：androidboot.hardware 丢失 -> ro.hardware 失效")
-        ok = False
+    if img.version == 4:
+        table_size, count, entry_size, bc_size = struct.unpack_from("<IIII", data, 2112)
+        if count == 0:
+            problems.append("fragment table is empty")
+        if entry_size < vbl.ENTRY_SIZE:
+            problems.append(f"fragment entry size {entry_size} < {vbl.ENTRY_SIZE}")
+        if len(img.bootconfig) != bc_size:
+            problems.append("bootconfig_size does not match parsed bootconfig")
+        if not img.bootconfig:
+            warnings.append("bootconfig is empty")
+        elif b"androidboot.hardware" not in img.bootconfig:
+            warnings.append("bootconfig has no androidboot.hardware")
+        if b"bootconfig" not in img.cmdline:
+            warnings.append("cmdline has no 'bootconfig' token")
+
+        expected_off = 0
+        for i, frag in enumerate(img.fragments):
+            if frag.get("offset") != expected_off:
+                warnings.append(f"fragment {i} offset {frag.get('offset')} != {expected_off} "
+                                "(gaps/overlaps are unusual but legal)")
+            expected_off = max(expected_off, (frag.get("offset") or 0) + len(frag["data"]))
     else:
-        print(f"bootconfig: {i['bc']!r}")
-        if b"androidboot.hardware" not in i["bc"]:
-            print("FAIL  bootconfig 缺 androidboot.hardware")
-            ok = False
+        warnings.append("header v3: no fragment table, recovery cannot ride in vendor_boot")
 
-    total = 0
-    for n, f in enumerate(i["frags"]):
-        print(f"frag{n}: type={f['type']}({TYPES.get(f['type'], '?')}) size={f['size']} "
-              f"off={f['off']} name={f['name']!r} md5={f['md5']}")
-        if f["off"] != total:
-            print(f"FAIL  frag{n} 偏移 {f['off']} != 累计 {total}（片段表不自洽）")
-            ok = False
-        total += f["size"]
-    if total != i["vrs"]:
-        print(f"FAIL  片段总长 {total} != vendor_ramdisk_size {i['vrs']}")
-        ok = False
+    for frag in img.fragments:
+        print(f"fragment type={frag['type']}({vbl.TYPE_NAMES.get(frag['type'], '?')}) "
+              f"name={frag['name'] or '-'} size={len(frag['data'])}B "
+              f"md5={hashlib.md5(frag['data']).hexdigest()}")
 
-    plat = [f for f in i["frags"] if f["type"] == 1]
-    if not plat:
-        print("FAIL  没有 platform 片段 -> 正常启动无 first-stage ramdisk")
-        ok = False
-    elif max(f["size"] for f in plat) < 1024 * 1024:
-        print(f"FAIL  platform 片段只有 {max(f['size'] for f in plat)}B（空 LZ4 帧）-> 正常启动必挂")
-        ok = False
-    elif stock_md5 and plat[0]["md5"] != stock_md5:
-        print(f"FAIL  platform 片段 md5 {plat[0]['md5']} != 原厂 {stock_md5}"
-              " -> 正常启动内容被 TWRP 污染")
-        ok = False
-
-    rec = [f for f in i["frags"] if f["type"] == 2]
-    if rec:
-        print(f"NOTE  recovery 片段 {rec[0]['size']}B（TWRP 应在这一片里）")
+    platforms = [f for f in img.fragments if f["type"] == 1]
+    if not platforms:
+        msg = "no platform fragment"
+        (problems if require_platform else warnings).append(msg)
     else:
-        print("WARN  没有 recovery 片段：recovery 模式会跑 platform 片段内容")
+        if max(len(f["data"]) for f in platforms) <= 8:
+            warnings.append("platform fragment is an empty lz4 frame")
+        elif max(len(f["data"]) for f in platforms) < 1024 * 1024:
+            warnings.append("platform fragment is smaller than 1 MiB")
 
-    print("RESULT:", "OK" if ok else "NOT FLASHABLE (正常启动会失败)")
+    if img.version == 4 and not any(f["type"] == 2 for f in img.fragments):
+        warnings.append("no recovery fragment (recovery mode will use platform)")
+
+    if stock_md5 and platforms and hashlib.md5(platforms[0]["data"]).hexdigest() != stock_md5:
+        problems.append(f"platform md5 {hashlib.md5(platforms[0]['data']).hexdigest()} "
+                        f"!= stock {stock_md5}")
+    if expect_md5 and platforms and hashlib.md5(platforms[0]["data"]).hexdigest() != expect_md5:
+        problems.append(f"platform md5 {hashlib.md5(platforms[0]['data']).hexdigest()} "
+                        f"!= expected {expect_md5}")
+
+    if not quiet:
+        for w in warnings:
+            print(f"WARN  {w}")
+    for p in problems:
+        print(f"FAIL  {p}")
+    ok = not problems
+    print("RESULT:", "OK" if ok else "FAILED")
     return ok
 
 
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    stock = None
-    if args[:1] == ["--stock"]:
-        if len(args) < 3:
-            print(__doc__)
-            sys.exit(2)
-        stock = parse(open(args[1], "rb").read())
-        stock = next((f["md5"] for f in stock["frags"] if f["type"] == 1), None)
-        args = args[2:]
-    if not args:
-        print(__doc__)
-        sys.exit(2)
-    results = [check(p, stock) for p in args]
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("images", nargs="+")
+    ap.add_argument("--stock", help="stock image; compare its platform fragment with each image")
+    ap.add_argument("--expect-platform-md5", help="required md5 of the platform fragment")
+    ap.add_argument("--require-platform", action="store_true",
+                    help="treat a missing platform fragment as an error")
+    ap.add_argument("--quiet", action="store_true", help="do not print warnings")
+    a = ap.parse_args()
+
+    stock_md5 = None
+    if a.stock:
+        try:
+            stock_md5 = vbl.platform_digest(Path(a.stock).read_bytes())
+        except (OSError, ValueError) as e:
+            sys.exit(f"{a.stock}: {e}")
+        if stock_md5 is None:
+            sys.exit(f"{a.stock}: no platform fragment")
+
+    results = [check(p, stock_md5, a.expect_platform_md5, a.require_platform, a.quiet)
+               for p in a.images]
     sys.exit(0 if all(results) else 1)
+
+
+if __name__ == "__main__":
+    main()

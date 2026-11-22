@@ -14,17 +14,17 @@ on:
           - 11.0
 
       DEVICE_TREE:
-        description: '设备树仓库地址'
+        description: '设备树仓库地址（任意 git 仓库，不要填示例）'
         required: true
-        default: 'https://gitee.com/zhiyu722/eebbk-s6-device-tree.git'
+        default: ''
       DEVICE_TREE_BRANCH:
         description: '设备树分支'
         required: true
         default: 'master'
       DEVICE_PATH:
-        description: '设备树存放路径'
+        description: '设备树存放路径（如 device/<厂商>/<机型>）'
         required: true
-        default: 'device/EEBBK/P20NH130'
+        default: ''
 
       BUILD_TARGET:
         description: '构建目标镜像'
@@ -35,6 +35,30 @@ on:
           - recovery
           - boot
           - vendorboot
+
+      VENDOR_BOOT_REPACK:
+        description: 'vendor_boot 重打包布局：auto/dual/single/off'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - dual
+          - single
+          - off
+      STOCK_VENDOR_BOOT:
+        description: '原厂 vendor_boot：URL 或仓库/工作区路径；留空则用设备树 prebuilt/vendor_boot_stock.img'
+        required: false
+        default: ''
+      VENDOR_BOOT_PAD_TO:
+        description: '补零到分区大小：auto=读 BoardConfig.mk，0=不补，或直接填字节数'
+        required: true
+        default: 'auto'
+      VENDOR_BOOT_PERMISSIVE:
+        description: '在 cmdline 追加 androidboot.selinux=permissive'
+        required: true
+        default: false
+        type: boolean
 
       RECOVERY_INSTALLER:
         description: '是否生成刷机包 ZIP（含 recovery-installer）'
@@ -75,6 +99,15 @@ jobs:
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+
+      - name: 校验必填输入
+        run: |
+          [ -n "${{ github.event.inputs.DEVICE_TREE }}" ] || { echo "::error::DEVICE_TREE 不能为空"; exit 1; }
+          [ -n "${{ github.event.inputs.DEVICE_PATH }}" ] || { echo "::error::DEVICE_PATH 不能为空"; exit 1; }
+          PAD="${{ github.event.inputs.VENDOR_BOOT_PAD_TO }}"
+          if [ "$PAD" != "auto" ] && ! [[ "$PAD" =~ ^[0-9]+$ ]]; then
+            echo "::error::VENDOR_BOOT_PAD_TO 必须是 auto、0 或字节数"; exit 1
+          fi
 
       - name: 准备编译环境
         run: |
@@ -218,14 +251,49 @@ jobs:
           export CCACHE_COMPRESS=1
           eval ${{ env.BUILD_CMD }}
 
-      - name: 修复 vendor_boot 打包（platform=原厂 / recovery=OrangeFox）
-        if: github.event.inputs.BUILD_TARGET == 'vendorboot'
+      - name: 准备原厂 vendor_boot（可选）
+        if: github.event.inputs.BUILD_TARGET == 'vendorboot' && github.event.inputs.VENDOR_BOOT_REPACK != 'off'
+        env:
+          STOCK_INPUT: ${{ github.event.inputs.STOCK_VENDOR_BOOT }}
+          DEVICE_TREE_DIR: ${{ github.workspace }}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/${{ github.event.inputs.DEVICE_PATH }}
+        run: |
+          set -euo pipefail
+          stock=""
+          if [ -n "$STOCK_INPUT" ]; then
+            case "$STOCK_INPUT" in
+              http://*|https://*)
+                curl -fL --retry 3 -o "$RUNNER_TEMP/vendor_boot_stock.img" "$STOCK_INPUT"
+                stock="$RUNNER_TEMP/vendor_boot_stock.img"
+                ;;
+              *)
+                [ -f "$STOCK_INPUT" ] || { echo "::error::找不到原厂 vendor_boot: $STOCK_INPUT"; exit 1; }
+                stock=$(realpath "$STOCK_INPUT")
+                ;;
+            esac
+          elif [ -f "$DEVICE_TREE_DIR/prebuilt/vendor_boot_stock.img" ]; then
+            stock="$DEVICE_TREE_DIR/prebuilt/vendor_boot_stock.img"
+          fi
+          echo "STOCK_VENDOR_BOOT=$stock" >> "$GITHUB_ENV"
+          if [ -n "$stock" ]; then
+            echo "原厂 vendor_boot: $stock"
+            python3 tools/check_vendor_boot.py "$stock" || true
+          else
+            echo "未提供原厂 vendor_boot：dual 模式不可用，auto 将退化为 single"
+          fi
+
+      - name: 重打包 vendor_boot（布局可配置）
+        if: github.event.inputs.BUILD_TARGET == 'vendorboot' && github.event.inputs.VENDOR_BOOT_REPACK != 'off'
+        env:
+          MODE: ${{ github.event.inputs.VENDOR_BOOT_REPACK }}
+          PAD_TO: ${{ github.event.inputs.VENDOR_BOOT_PAD_TO }}
+          PERMISSIVE: ${{ github.event.inputs.VENDOR_BOOT_PERMISSIVE == 'true' && '1' || '0' }}
+          DEVICE_TREE: ${{ github.workspace }}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}/${{ github.event.inputs.DEVICE_PATH }}
         run: |
           set -e
           BASE="${GITHUB_WORKSPACE}/OrangeFox/fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
           IMG=$(ls "$BASE"/out/target/product/*/vendor_boot.img 2>/dev/null | head -n1)
           [ -n "$IMG" ] || { echo "未找到 vendor_boot.img"; exit 1; }
-          echo "构建产物: $IMG"
+          echo "构建产物: $IMG (MODE=$MODE PAD_TO=$PAD_TO)"
           bash "${{ github.workspace }}/tools/repack_vendor_boot.sh" "$IMG"
 
       - name: 输出 ccache 统计信息

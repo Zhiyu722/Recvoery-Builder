@@ -30,25 +30,25 @@ on:
         default: ''
 
       device_tree_repo_url:
-        description: '设备树 GitHub 仓库地址'
+        description: '设备树仓库地址（任意 git 仓库，不要填示例）'
         required: true
-        default: 'https://github.com/rtyutechstudio/android_device_oppo_a32-twrp'
+        default: ''
         type: string
       device_tree_branch:
         description: '设备树分支'
         required: true
-        default: 'main'
+        default: 'master'
         type: string
       device_tree_path:
-        description: '设备树在源码中的存放路径'
+        description: '设备树在源码中的存放路径（如 device/<厂商>/<机型>）'
         required: true
-        default: 'device/oppo/PDVM00'
+        default: ''
         type: string
 
       lunch_target:
         description: 'lunch 目标 (例如 twrp_<codename>-eng)'
         required: true
-        default: 'twrp_PDVM00-eng'
+        default: ''
         type: string
 
 jobs:
@@ -59,6 +59,12 @@ jobs:
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+
+      - name: 校验必填输入
+        run: |
+          [ -n "${{ github.event.inputs.device_tree_repo_url }}" ] || { echo "::error::device_tree_repo_url 不能为空"; exit 1; }
+          [ -n "${{ github.event.inputs.device_tree_path }}" ] || { echo "::error::device_tree_path 不能为空"; exit 1; }
+          [ -n "${{ github.event.inputs.lunch_target }}" ] || { echo "::error::lunch_target 不能为空"; exit 1; }
 
       - name: 准备编译环境 (Legacy)
         run: |

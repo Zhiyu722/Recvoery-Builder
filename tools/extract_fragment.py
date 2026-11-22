@@ -1,59 +1,62 @@
 #!/usr/bin/env python3
-"""从 vendor_boot (header v4) 镜像里取出指定 type 的片段。
+"""Extract a fragment from a vendor_boot image (header v3/v4).
 
-  python3 extract_fragment.py img --list
-  python3 extract_fragment.py img --type 2 --out recovery.lz4
+  extract_fragment.py img --list
+  extract_fragment.py img --type 2 --out recovery.lz4
+  extract_fragment.py img --name dlkm --out dlkm.lz4
 
-找到则退出码 0，未找到退出码 3（方便 shell 里做 fallback）。
+Exit code 0 when found, 3 when not found.
 """
 import argparse
-import struct
 import sys
+from pathlib import Path
 
-PS = 4096
-
-
-def al(x):
-    return (x + PS - 1) // PS * PS
+import vendor_boot_lib as vbl
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("img")
-    ap.add_argument("--type", type=int, default=2)
+    ap.add_argument("--type", help="fragment type: 0-3 or platform/recovery/dlkm")
+    ap.add_argument("--name", help="fragment name (exact match)")
+    ap.add_argument("--index", type=int, help="fragment index")
     ap.add_argument("--out")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
 
-    d = open(a.img, "rb").read()
-    if d[:8] != b"VNDRBOOT":
-        sys.exit("不是 vendor_boot 镜像")
-    hsz, dtbsz = struct.unpack_from("<II", d, 2096)
-    tsz, num, esz, bcsz = struct.unpack_from("<IIII", d, 2112)
-    vrs = struct.unpack_from("<I", d, 24)[0]
-    base = al(hsz)
-    tbl = base + al(vrs) + al(dtbsz)
+    try:
+        img = vbl.parse(Path(a.img).read_bytes())
+    except (OSError, ValueError) as e:
+        sys.exit(f"{a.img}: {e}")
 
-    frags = []
-    for i in range(num):
-        o = tbl + i * esz
-        sz, off, ty = struct.unpack_from("<III", d, o)
-        nm = d[o + 12:o + 44].split(b"\x00")[0].decode("ascii", "replace")
-        frags.append((ty, sz, off, nm))
+    if a.list:
+        for i, f in enumerate(img.fragments):
+            print(f"index={i} type={f['type']}({vbl.TYPE_NAMES.get(f['type'], '?')}) "
+                  f"size={len(f['data'])} off={f.get('offset', '-')} name={f['name']!r}")
+        if not img.fragments:
+            print("(no fragments)")
+        return
 
-    for ty, sz, off, nm in frags:
-        print(f"type={ty} size={sz} off={off} name={nm!r}")
+    matches = list(enumerate(img.fragments))
+    if a.type is not None:
+        try:
+            ftype = vbl.type_id(a.type)
+        except ValueError as e:
+            sys.exit(str(e))
+        matches = [(i, f) for i, f in matches if f["type"] == ftype]
+    if a.name is not None:
+        matches = [(i, f) for i, f in matches if f["name"] == a.name]
+    if a.index is not None:
+        matches = [(i, f) for i, f in matches if i == a.index]
 
-    hit = next((f for f in frags if f[0] == a.type), None)
-    if hit is None:
+    if not matches:
         sys.exit(3)
-    if not a.list:
-        if not a.out:
-            sys.exit("需要 --out")
-        ty, sz, off, nm = hit
-        with open(a.out, "wb") as fp:
-            fp.write(d[base + off:base + off + sz])
-        print(f"wrote {a.out} ({sz}B)")
+    index, frag = matches[0]
+    if not a.out:
+        sys.exit("need --out (or use --list)")
+    Path(a.out).write_bytes(frag["data"])
+    print(f"wrote {a.out} ({len(frag['data'])}B, index={index}, type={frag['type']}, "
+          f"name={frag['name']!r})")
 
 
 if __name__ == "__main__":
