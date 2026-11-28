@@ -24,6 +24,7 @@
 | `stock_vendor_boot` / `STOCK_VENDOR_BOOT` | 原厂 `vendor_boot` 的 URL 或路径，可留空 |
 | `vendor_boot_pad_to` / `VENDOR_BOOT_PAD_TO` | `auto`、`0` 或字节数 |
 | `vendor_boot_permissive` / `VENDOR_BOOT_PERMISSIVE` | 是否追加 `androidboot.selinux=permissive` |
+| `twrp_init_as_root` | 删除设备树里的 `recovery/root/init` 覆盖，让 TWRP 自带 init 直接作为 `/init`（默认 true） |
 
 `vendor_boot` 目标只会在 `vendor_boot_repack != off` 时执行重打包。
 
