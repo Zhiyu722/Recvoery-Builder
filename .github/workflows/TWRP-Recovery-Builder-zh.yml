@@ -112,6 +112,12 @@ on:
         default: false
         type: boolean
 
+      twrp_init_as_root:
+        description: '把 TWRP 自带 init 直接作为 /init（删除设备树 recovery/root/init 覆盖）'
+        required: true
+        default: true
+        type: boolean
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -267,6 +273,17 @@ jobs:
         run: |
           cd twrp
           repo sync --force-sync --no-tags --no-clone-bundle -j$(nproc)
+
+      - name: 将 TWRP init 作为 /init
+        if: github.event.inputs.twrp_init_as_root == 'true'
+        run: |
+          TARGET="twrp/${{ github.event.inputs.device_tree_path }}/recovery/root/init"
+          if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+            rm -f "$TARGET"
+            echo "✅ 已移除设备树 init 覆盖：$TARGET"
+          else
+            echo "ℹ️ 设备树没有 init 覆盖，TWRP init 会直接落在 /init"
+          fi
 
       - name: 临时绕过 Soong 插件验证
         run: |
